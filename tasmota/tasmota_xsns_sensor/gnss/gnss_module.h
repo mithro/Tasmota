@@ -26,6 +26,23 @@ extern "C" {
 /* The UART speed the driver runs each receiver at. */
 uint32_t gnss_module_baud(uint8_t module);
 
+/* The UART speed each receiver starts at from power-up, before any
+ * configuration. */
+uint32_t gnss_module_factory_baud(uint8_t module);
+
+/* The speeds to try, in order, for a receiver that is already known:
+ * last_baud (where it was found last time, 0 for none), then the speed this
+ * firmware runs it at (it keeps that while powered, across an ESP32 reset),
+ * then its power-up default. No speed appears twice. Returns how many. */
+uint8_t gnss_module_boot_bauds(uint8_t module, uint32_t last_baud, uint32_t *out, uint8_t max);
+
+/* Short names, as the GpsModule command takes them: "ublox7", "m8", "m10",
+ * "lc29h"; "auto" for GNSS_MODULE_UNKNOWN. */
+const char *gnss_module_key(uint8_t module);
+
+/* The receiver a name means. Returns false for a name it does not know. */
+bool gnss_module_from_key(const char *key, uint8_t *module);
+
 /* Identification probes, step 0 and 1. Returns the bytes to send, or 0
  * past the last step. */
 size_t gnss_module_probe(uint8_t step, uint8_t *out, size_t out_len);

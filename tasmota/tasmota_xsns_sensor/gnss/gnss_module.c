@@ -25,6 +25,55 @@ uint32_t gnss_module_baud(uint8_t module) {
   }
 }
 
+uint32_t gnss_module_factory_baud(uint8_t module) {
+  switch (module) {
+    case GNSS_MODULE_UBLOX7:
+    case GNSS_MODULE_UBLOX_M8: return 9600;  /* u-blox UART1 default */
+    case GNSS_MODULE_UBLOX_M10: return BAUD_M10;
+    case GNSS_MODULE_QUECTEL_LC29H: return BAUD_LC29H;
+    default: return 0;
+  }
+}
+
+static uint8_t add_baud(uint32_t *out, uint8_t n, uint8_t max, uint32_t baud) {
+  if (!baud || n >= max) { return n; }
+  for (uint8_t i = 0; i < n; i++) {
+    if (out[i] == baud) { return n; }
+  }
+  out[n] = baud;
+  return (uint8_t)(n + 1);
+}
+
+uint8_t gnss_module_boot_bauds(uint8_t module, uint32_t last_baud, uint32_t *out, uint8_t max) {
+  uint8_t n = add_baud(out, 0, max, last_baud);
+  n = add_baud(out, n, max, gnss_module_baud(module));
+  return add_baud(out, n, max, gnss_module_factory_baud(module));
+}
+
+static const char *const KEYS[] = {"auto", "ublox7", "m8", "m10", "lc29h"};
+static const uint8_t KEY_MODULES[] = {GNSS_MODULE_UNKNOWN, GNSS_MODULE_UBLOX7, GNSS_MODULE_UBLOX_M8,
+                                      GNSS_MODULE_UBLOX_M10, GNSS_MODULE_QUECTEL_LC29H};
+
+const char *gnss_module_key(uint8_t module) {
+  for (size_t i = 0; i < sizeof(KEY_MODULES); i++) {
+    if (KEY_MODULES[i] == module) { return KEYS[i]; }
+  }
+  return "other";
+}
+
+bool gnss_module_from_key(const char *key, uint8_t *module) {
+  for (size_t i = 0; i < sizeof(KEY_MODULES); i++) {
+    const char *k = KEYS[i];
+    const char *p = key;
+    while (*k && *p && (*p | 0x20) == *k) { k++; p++; }  /* case-insensitive */
+    if (!*k && !*p) {
+      *module = KEY_MODULES[i];
+      return true;
+    }
+  }
+  return false;
+}
+
 size_t gnss_nmea_command(char *out, size_t out_len, const char *body) {
   uint8_t ck = 0;
   for (const char *p = body; *p; p++) { ck ^= (uint8_t)*p; }
@@ -134,6 +183,7 @@ static const uint64_t M10_VALUES[] = {
 static size_t m10(uint8_t index, uint8_t *out, size_t out_len) {
   switch (index) {
     case 0: return gnss_ubx_cfg_valset(out, out_len, 0x01 /* RAM */, M10_KEYS, M10_VALUES, (uint8_t)N(M10_KEYS));
+    case 1: return gnss_ubx_poll(out, out_len, 0x0A, 0x04);  /* MON-VER: model and firmware, for the record */
     default: return 0;
   }
 }
@@ -141,6 +191,7 @@ static size_t m10(uint8_t index, uint8_t *out, size_t out_len) {
 /* --- Quectel LC29H --------------------------------------------------------- */
 
 static const char *const LC29H_COMMANDS[] = {
+  "PQTMVERNO",     /* model and firmware, for the record */
   "PAIR021",       /* chip and firmware version */
   "PAIR062,8,1",   /* GST every fix: position error estimates. Confirmed on the LC29H(AA) by
                       Quectel's forum (not supported on the DA variant). */
