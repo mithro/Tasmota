@@ -530,6 +530,7 @@ const char kSensorNames[] PROGMEM =
   D_SENSOR_MIEL_HVAC_MB_TX "|" D_SENSOR_MIEL_HVAC_MB_RX "|" D_SENSOR_MIEL_HVAC_MB_TXEN "|"
 #endif
   D_SENSOR_CC1101_CS "|"
+  "GPS PPS" "|"                         // a literal, so no language file needs a new entry
 ;
 
 const char kSensorNamesFixed[] PROGMEM =
@@ -1127,6 +1128,7 @@ const uint16_t kGpioNiceList[] PROGMEM = {
 #ifdef USE_GPS
   AGPIO(GPIO_GPS_TX),                            // GPS serial interface
   AGPIO(GPIO_GPS_RX) + AGMAX(MAX_GPS_RX),        // GPS serial interface
+  AGPIO(GPIO_GPS_PPS),                           // GPS one pulse per second
 #endif
 #ifdef USE_HM10
   AGPIO(GPIO_HM10_TX),                           // HM10 serial interface
