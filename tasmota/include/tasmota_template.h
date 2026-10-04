@@ -244,6 +244,7 @@ enum UserSelectablePins {
   GPIO_MIEL_HVAC_MB_TX, GPIO_MIEL_HVAC_MB_RX, GPIO_MIEL_HVAC_MB_TXEN,  // Mitsubishi Electric HVAC Modbus RTU slave
 #endif
   GPIO_CC1101_CS,                       // CC1101 SPI chip select
+  GPIO_GPS_PPS,                         // GPS one pulse per second (esp32-to-gps)
   GPIO_SENSOR_END };
 
 // Error as warning to rethink GPIO usage with max 2045
