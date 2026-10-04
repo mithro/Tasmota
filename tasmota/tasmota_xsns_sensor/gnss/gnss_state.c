@@ -15,11 +15,25 @@ void gnss_state_init(gnss_state_t *s) {
   s->diff_station = -1;
   s->antenna = GNSS_ANT_NOT_REPORTED;
   s->epoch = 1;
+  s->epoch_tod_cs = 0xffffffffu;
 }
 
 void gnss_new_epoch(gnss_state_t *s) {
   s->epoch++;
   gnss_prune_sats(s);
+}
+
+void gnss_epoch_time(gnss_state_t *s, uint32_t tod_cs) {
+  if (tod_cs == s->epoch_tod_cs) { return; }
+  s->epoch_tod_cs = tod_cs;
+  gnss_new_epoch(s);
+}
+
+void gnss_sat_cno(gnss_state_t *s, gnss_sat_t *sat, uint8_t cno) {
+  if (sat->cno_epoch != s->epoch || cno > sat->cno) {
+    sat->cno = cno;
+  }
+  sat->cno_epoch = s->epoch;
 }
 
 gnss_sat_t *gnss_sat(gnss_state_t *s, uint8_t gnss, uint8_t svid) {

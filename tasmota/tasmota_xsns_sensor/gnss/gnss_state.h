@@ -85,6 +85,7 @@ typedef struct {
   uint8_t cno;       /* dB-Hz, 0 when not tracked */
   bool used;         /* used in the navigation solution */
   uint32_t epoch;    /* gnss_state_t.epoch when last reported */
+  uint32_t cno_epoch;  /* epoch of cno: within one epoch the strongest signal wins */
 } gnss_sat_t;
 
 typedef struct {
@@ -95,7 +96,8 @@ typedef struct {
   uint16_t millisecond;
   uint32_t time_accuracy_ns;        /* UBX NAV-PVT tAcc; 0 when not reported */
   uint32_t epoch;                   /* counts navigation epochs (time-of-day changes) */
-  uint32_t nmea_tod_ms;             /* time of day of the current NMEA epoch, ms */
+  uint32_t epoch_tod_cs;            /* UTC time of day of the current epoch, 0.01 s; 0xffffffff before the first */
+  uint32_t gsa_epoch;               /* epoch whose GSA set the used flags */
 
   /* Fix and position. */
   uint8_t fix_type;                 /* gnss_fix_type_t */
@@ -159,6 +161,14 @@ void gnss_state_init(gnss_state_t *s);
 /* Start a new navigation epoch: satellites not reported again are dropped
  * from the table two epochs later. */
 void gnss_new_epoch(gnss_state_t *s);
+
+/* Report the UTC time of day (0.01 s) of the data being parsed: starts a new
+ * epoch when it differs from the current one. NMEA and UBX report the same
+ * UTC time for the same fix, so a receiver sending both advances once. */
+void gnss_epoch_time(gnss_state_t *s, uint32_t tod_cs);
+
+/* Record a C/N0 reading: the strongest signal within an epoch wins. */
+void gnss_sat_cno(gnss_state_t *s, gnss_sat_t *sat, uint8_t cno);
 
 /* Find or add a satellite. Returns NULL when the table is full. */
 gnss_sat_t *gnss_sat(gnss_state_t *s, uint8_t gnss, uint8_t svid);
