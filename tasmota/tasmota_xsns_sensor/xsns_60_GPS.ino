@@ -23,6 +23,11 @@
   Version Date      Action    Description
   --------------------------------------------------------------------------------------------
 
+  1.0.0.0 20261004  extend    - esp32-to-gps (github.com/mithro/esp32-to-gps): NMEA and UBX through
+                                the pure-C core in gnss/, receiver identification and configuration
+                                (u-blox 7, M8, M10, Quectel LC29H), NTRIP corrections, PPS input,
+                                full state over MQTT with Home Assistant discovery, Gps* commands.
+  ---
   0.9.3.0 20200214  integrate - fix set lat/lon via commandd 13, V-Port now works parallel
   ---
   0.9.2.0 20200110  integrate - Added UART-over-TCP/IP-bridge (virtual serial port). Minor tweaks.
@@ -33,72 +38,43 @@
                     forked    - from arendst/tasmota                    - https://github.com/arendst/Sonoff-Tasmota
                     base      - code base from arendst and              - https://www.youtube.com/watch?v=TwhCX0c8Xe0
 
-## GPS-driver for the Ublox-series 6-8
-Driver is tested on a NEO-6m and a Beitian-220. Series 7 should work too. This adds only about 6kb to the program size, because the efficient UBX-protocol is used. These modules are quite cheap, starting at about 3.50€ for the NEO-6m.
+## GPS driver
+
+Reads the receiver through the pure-C core in tasmota_xsns_sensor/gnss/, which frames and decodes
+NMEA and UBX, identifies the receiver and builds its configuration. The core is compiled and tested
+on a host by github.com/mithro/esp32-to-gps.
+
+Supported receivers: u-blox 7, u-blox M8 (including the LEA-M8T), u-blox M10 (MAX-M10S) and the
+Quectel LC29H. Any other receiver that speaks NMEA is read, but not configured.
 
 ## Features:
-- get position and time data
+- position, time, motion, accuracy, DOPs, every satellite with its signal, receiver identity and RF
 - sets system time automatically and Settings->latitude and Settings->longitude via command
+- RTCM corrections from an NTRIP caster, passed to the receiver
+- one pulse per second input (GPIO "GPS PPS")
+- full state on tele/<topic>/GNSS and tele/<topic>/GNSS_SATS, with Home Assistant discovery
 - can log postion data with timestamp to flash with a small memory footprint of only 12 Bytes per record
 - constructs a GPX-file for download of this data
 - Web-UI
 - simplified NTP-server and UART-over-TCP/IP-bridge (virtual serial port)
-- command interface
-- velocity and heading information with #define USE_GPS_VELOCITY
 
 ## Usage:
-The serial pins are GPS_RX and GPS_TX, no further installation steps needed. To get more debug information compile it with option "DEBUG_TASMOTA_SENSOR".
-
+The serial pins are GPS_RX and GPS_TX, and optionally GPS PPS. The GPS_RX variant no longer sets the
+speed: the driver searches 9600, 38400 and 115200 baud unless GpsBaud fixes it.
 
 ## Commands:
 
-+ sensor60 0
-  write to all available sectors, then restart and overwrite the older ones
++ GpsBaud <speed>          fix the receiver's UART speed; 0 searches (default)
++ GpsNtrip 0               corrections off
++ GpsNtrip 1               corrections from the ten64 proxy, mountpoint chosen by receiver (default)
++ GpsNtrip <host>:<port>/<mount>[ <user> <password>]   corrections from a caster of your choice
++ GpsPeriod <seconds>      how often tele/<topic>/GNSS is published (default 10)
++ GpsSatEntities 0|1       one Home Assistant entity per satellite (default 0)
++ GpsHass 0|1              Home Assistant discovery (default 1)
++ GpsReinit                identify and configure the receiver again
++ GpsStatus                the full state, as published on tele/<topic>/GNSS
 
-+ sensor60 1
-  write to all available sectors, then restart and overwrite the older ones
-
-+ sensor60 2
-  filter out horizontal drift noise
-
-+ sensor60 3
-  turn off noise filter
-
-+ sensor60 4
-  start recording, new data will be appended
-
-+ sensor60 5
-  start new recording, old data will lost
-
-+ sensor60 6
-  stop recording, download link will be visible in Web-UI
-
-+ sensor60 7
-  send mqtt on new postion + TELE -> consider to set TELE to a very high value
-
-+ sensor60 8
-  only TELE message
-
-+ sensor60 9
-  start NTP-server
-
-+ sensor60 10
-  deactivate NTP-server
-
-+ sensor60 11
-  force update of Tasmota-system-UTC with every new GPS-time-message
-
-+ sensor60 12
-  do not update of Tasmota-system-UTC with every new GPS-time-message
-
-+ sensor60 13
-  set latitude and longitude in settings
-
-+ sensor60 14
-  open virtual serial port over TCP, usable for u-center
-
-+ sensor60 15
-  pause virtual serial port over TCP
++ sensor60 0 .. 15, 1001 .. 1065   as before (flash log, noise filter, NTP server, virtual port, rate)
 
 ## Rules examples for SSD1306 32x128
 
@@ -107,7 +83,7 @@ rule1 on tele-GPS#lat do DisplayText [s1p21c1l01f1]LAT: %value% endon on tele-GP
 
 rule2  on tele-GPS#int>9 do DisplayText [f0c9l4]I%value%  endon  on tele-GPS#int<10 do DisplayText [f0c9l4]I0%value%  endon on tele-GPS#fil==1 do DisplayText [f0c18l4]F endon on tele-GPS#fil==0 do DisplayText [f0c18l4]N endon
 
-rule3 on tele-FLOG#sec do DisplayText  [f0c1l4]SAV:%value%  endon on tele-FLOG#rec==1 do DisplayText [f0c1l4]REC: endon on tele-FLOG#mode do DisplayText [f0c14l4]M%value% endon
+rule3 on tele-FLOG#sec do DisplayText  [f0c1l4]SAV:%value% endon on tele-FLOG#rec==1 do DisplayText [f0c1l4]REC: endon on tele-FLOG#mode do DisplayText [f0c14l4]M%value% endon
 
 \*********************************************************************************************/
 
@@ -115,6 +91,14 @@ rule3 on tele-FLOG#sec do DisplayText  [f0c1l4]SAV:%value%  endon on tele-FLOG#r
 
 #include "NTPServer.h"
 #include "NTPPacket.h"
+
+#include "tasmota_xsns_sensor/gnss/gnss_state.h"
+#include "tasmota_xsns_sensor/gnss/gnss_stream.h"
+#include "tasmota_xsns_sensor/gnss/gnss_nmea.h"
+#include "tasmota_xsns_sensor/gnss/gnss_ubx.h"
+#include "tasmota_xsns_sensor/gnss/gnss_rtcm.h"
+#include "tasmota_xsns_sensor/gnss/gnss_module.h"
+#include "tasmota_xsns_sensor/gnss/gnss_json.h"
 
 /*********************************************************************************************\
  * constants
@@ -128,58 +112,27 @@ const char kUBXTypes[] PROGMEM = "UBX";
 
 #define UBX_LAT_LON_THRESHOLD 100 // filter out some noise of local drift
 
-#define UBX_SERIAL_BUFFER_SIZE 256
+#define UBX_SERIAL_BUFFER_SIZE 2048   // the LC29H sends ~1.2 kB per fix at 115200 baud
 #define UBX_TCP_PORT           1234
 #define NTP_MILLIS_OFFSET      50              // estimated latency in milliseconds
+
+#define GNSS_CFG_FILE          "/gnss.cfg"
+#define GNSS_CFG_MAGIC         0x47505331      // "GPS1"
+#define GNSS_NTRIP_HOST        "10.1.10.1"     // the ten64 proxy, as the IoT VLAN reaches it
+#define GNSS_NTRIP_PORT        2101
+#define GNSS_SEARCH_MS         2500            // time at each speed while searching
+#define GNSS_PROBE_MS          1500            // time to wait for an identification reply
+#define GNSS_CMD_GAP_MS        150             // between configuration commands
+#define GNSS_SILENT_MS         10000           // no valid frame this long: search again
+#define GNSS_MAX_ANNOUNCED     128             // per-satellite entities remembered
+
+static const uint32_t kGnssBauds[] = {9600, 38400, 115200};
 
 /********************************************************************************************\
 | *globals
 \*********************************************************************************************/
 
-const char UBLOX_INIT[] PROGMEM = {
-  // Disable NMEA
-  0xB5,0x62,0x06,0x01,0x08,0x00,0xF0,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x24, // GxGGA off
-  0xB5,0x62,0x06,0x01,0x08,0x00,0xF0,0x01,0x00,0x00,0x00,0x00,0x00,0x01,0x01,0x2B, // GxGLL off
-  0xB5,0x62,0x06,0x01,0x08,0x00,0xF0,0x02,0x00,0x00,0x00,0x00,0x00,0x01,0x02,0x32, // GxGSA off
-  0xB5,0x62,0x06,0x01,0x08,0x00,0xF0,0x03,0x00,0x00,0x00,0x00,0x00,0x01,0x03,0x39, // GxGSV off
-  0xB5,0x62,0x06,0x01,0x08,0x00,0xF0,0x04,0x00,0x00,0x00,0x00,0x00,0x01,0x04,0x40, // GxRMC off
-  0xB5,0x62,0x06,0x01,0x08,0x00,0xF0,0x05,0x00,0x00,0x00,0x00,0x00,0x01,0x05,0x47, // GxVTG off
-
-  // Disable UBX
-  0xB5,0x62,0x06,0x01,0x08,0x00,0x01,0x07,0x00,0x00,0x00,0x00,0x00,0x00,0x17,0xDC, //NAV-PVT off
-  0xB5,0x62,0x06,0x01,0x08,0x00,0x01,0x02,0x00,0x00,0x00,0x00,0x00,0x00,0x12,0xB9, //NAV-POSLLH off
-  0xB5,0x62,0x06,0x01,0x08,0x00,0x01,0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x13,0xC0, //NAV-STATUS off
-  0xB5,0x62,0x06,0x01,0x08,0x00,0x01,0x21,0x00,0x00,0x00,0x00,0x00,0x00,0x31,0x92, //NAV-TIMEUTC off
-#ifdef USE_GPS_VELOCITY
-  0xB5,0x62,0x06,0x01,0x08,0x00,0x01,0x12,0x00,0x00,0x00,0x00,0x00,0x00,0x22,0x29, //NAV-VELNED off
-#endif  // USE_GPS_VELOCITY
-
-  // Enable UBX
-  // 0xB5,0x62,0x06,0x01,0x08,0x00,0x01,0x07,0x00,0x01,0x00,0x00,0x00,0x00,0x18,0xE1, //NAV-PVT on
-  0xB5,0x62,0x06,0x01,0x08,0x00,0x01,0x02,0x00,0x01,0x00,0x00,0x00,0x00,0x13,0xBE, //NAV-POSLLH on
-  0xB5,0x62,0x06,0x01,0x08,0x00,0x01,0x03,0x00,0x01,0x00,0x00,0x00,0x00,0x14,0xC5, //NAV-STATUS on
-  0xB5,0x62,0x06,0x01,0x08,0x00,0x01,0x21,0x00,0x01,0x00,0x00,0x00,0x00,0x32,0x97, //NAV-TIMEUTC on
-#ifdef USE_GPS_VELOCITY
-  0xB5,0x62,0x06,0x01,0x08,0x00,0x01,0x12,0x00,0x01,0x00,0x00,0x00,0x00,0x23,0x2E, //NAV-VELNED on
-#endif  // USE_GPS_VELOCITY
-  // Rate - we will not reset it for the moment after restart
-  //  0xB5,0x62,0x06,0x08,0x06,0x00,0x64,0x00,0x01,0x00,0x01,0x00,0x7A,0x12, //(10Hz)
-  //  0xB5,0x62,0x06,0x08,0x06,0x00,0xC8,0x00,0x01,0x00,0x01,0x00,0xDE,0x6A, //(5Hz)
-  //  0xB5,0x62,0x06,0x08,0x06,0x00,0xE8,0x03,0x01,0x00,0x01,0x00,0x01,0x39 //(1Hz)
-  //  0xB5,0x62,0x06,0x08,0x06,0x00,0xD0,0x07,0x01,0x00,0x01,0x00,0xED,0xBD //(0.5Hz)
-};
-
-char       UBX_name[4];
-
 struct UBX_t {
-  const char UBX_HEADER[2]        = { 0xB5, 0x62 }; // TODO: Check if we really save space here inside the struct
-  const char NAV_POSLLH_HEADER[2] = { 0x01, 0x02 };
-  const char NAV_STATUS_HEADER[2] = { 0x01, 0x03 };
-  const char NAV_TIME_HEADER[2]   = { 0x01, 0x21 };
-#ifdef USE_GPS_VELOCITY
-  const char NAV_VEL_HEADER[2]    = { 0x01, 0x12 };
-#endif  // USE_GPS_VELOCITY
-
   int32_t lat;
   int32_t lon;
 
@@ -194,76 +147,6 @@ struct UBX_t {
     uint8_t bytes[sizeof(entry_t)];
   } rec_buffer;
 
-  struct POLL_MSG {
-    uint8_t cls;
-    uint8_t id;
-    uint16_t zero;
-  };
-
-  struct NAV_POSLLH {
-    uint8_t cls;               // 0x01
-    uint8_t id;                // 0x02
-    uint16_t len;              // 28 bytes
-    uint32_t iTOW;             // ms
-    int32_t lon;               // 1e-7, degree
-    int32_t lat;               // 1e-7, degree
-    int32_t alt;               // mm
-    int32_t hMSL;              // mm
-    uint32_t hAcc;             // mm
-    uint32_t vAcc;             // mm
-  };
-
-  struct NAV_STATUS {
-    uint8_t cls;               // 0x01
-    uint8_t id;                // 0x03
-    uint16_t len;              // 16 bytes
-    uint32_t iTOW;             // ms
-    uint8_t gpsFix;            //
-    uint8_t flags;             // bit 0 - gpsfix valid
-    uint8_t fixStat;           //
-    uint8_t flags2;            //
-    uint32_t ttff;             // ms
-    uint32_t msss;             // ms
-  };
-
-  struct NAV_TIME_UTC {
-    uint8_t cls;               // 0x01
-    uint8_t id;                // 0x21
-    uint16_t len;              // 20 bytes
-    uint32_t iTOW;             // ms
-    uint32_t tAcc;             // ns
-    int32_t nano;              // Nanoseconds of second, range -1e9 .. 1e9 (UTC)
-    uint16_t year;             // y
-    uint8_t month;             // month
-    uint8_t day;               // d
-    uint8_t hour;              // h
-    uint8_t min;               // min
-    uint8_t sec;               // s
-    struct {
-      uint8_t UTC:1;
-      uint8_t WKN:1;           // week number
-      uint8_t TOW:1;           // time of week
-      uint8_t padding:5;
-    } valid;
-  };
-
-#ifdef USE_GPS_VELOCITY
-  struct NAV_VEL {
-    uint8_t cls;               // 0x01
-    uint8_t id;                // 0x12
-    uint16_t len;              // 36 bytes
-    uint32_t iTOW;             // ms
-    int32_t velN;              // cm/s
-    int32_t velE;              // cm/s
-    int32_t velD;              // cm/s
-    uint32_t speed;            // cm/s
-    uint32_t gSpeed;           // cm/s
-    int32_t heading;           // 1e-5, degree
-    uint32_t sAcc;             // cm/s
-    uint32_t cAcc;             // 1e-5, degree
-  };
-#endif  // USE_GPS_VELOCITY
-
   struct CFG_RATE {
     uint8_t cls;               // 0x06
     uint8_t id;                // 0x08
@@ -271,16 +154,9 @@ struct UBX_t {
     uint16_t measRate;         // in every ms -> 1 Hz = 1000 ms; 10 Hz = 100 ms -> x = 1000 ms / Hz
     uint16_t navRate;          //  x measurements for 1 navigation event
     uint16_t timeRef;          //  align to time system: 0= UTC, 1 = GPS, 2 = GLONASS, ...
-    char CK[2];                // checksum
   };
 
   struct {
-    uint32_t last_iTOW;
-    int32_t last_alt;
-    uint32_t last_hAcc;
-    uint32_t last_vAcc;
-    uint8_t gpsFix;
-    uint8_t non_empty_loops;   // in case of an unintended reset of the GPS, the serial interface will get flooded with NMEA
     uint16_t log_interval;     // in tenth of seconds
     int32_t timeOffset;        // roughly computed offset millis() - iTOW
   } state;
@@ -291,39 +167,77 @@ struct UBX_t {
     uint32_t send_when_new:1;  // no teleinterval
     uint32_t send_UI_only:1;
     uint32_t runningNTP:1;
-    // uint32_t blockedNTP:1;
     uint32_t forceUTCupdate:1;
     uint32_t runningVPort:1;
-    // TODO: more to come
   } mode;
-
-  union {
-    NAV_POSLLH navPosllh;
-    NAV_STATUS navStatus;
-    NAV_TIME_UTC navTime;
-#ifdef USE_GPS_VELOCITY
-    NAV_VEL navVel;
-#endif  // USE_GPS_VELOCITY
-    POLL_MSG pollMsg;
-    CFG_RATE cfgRate;
-  } Message;
 
   uint32_t utc_time;
 
-  uint8_t TCPbuf[UBX_SERIAL_BUFFER_SIZE];
+  uint8_t TCPbuf[256];
   size_t TCPbufSize;
 } UBX;
 
-enum UBXMsgType {
-  MT_NONE,
-  MT_NAV_POSLLH,
-  MT_NAV_STATUS,
-  MT_NAV_TIME,
-#ifdef USE_GPS_VELOCITY
-  MT_NAV_VEL,
-#endif  // USE_GPS_VELOCITY
-  MT_POLL
+enum GnssPhase { GNSS_SEARCH, GNSS_PROBE, GNSS_CONFIGURE, GNSS_RUNNING };
+
+struct GnssSettings {
+  uint32_t magic;
+  uint32_t baud;               // 0 = search
+  uint16_t period;             // seconds between tele/<topic>/GNSS
+  uint8_t sat_entities;
+  uint8_t hass;
+  uint8_t ntrip;               // 0 off, 1 ten64 proxy, 2 custom
+  char host[64];
+  uint16_t port;
+  char mount[32];
+  char user[32];
+  char password[32];
 };
+
+struct GNSS_t {
+  gnss_state_t st;
+  gnss_stream_t stream;
+  gnss_rtcm_t rtcm;
+  gnss_dechunk_t dechunk;
+  GnssSettings cfg;
+
+  uint8_t phase;
+  uint8_t baud_index;
+  uint32_t baud;
+  uint32_t phase_ms;           // when the current phase / step started
+  uint8_t step;                // probe step or configuration index
+  uint32_t last_frame_ms;
+  bool got_frame;              // a valid frame since the phase started
+  uint32_t last_epoch;
+
+  // NTRIP
+  WiFiClient *ntrip;
+  uint8_t corr_state;
+  char corr_mount[33];
+  char corr_error[48];
+  uint32_t next_try_ms;
+  uint32_t backoff_s;
+  bool header_done;
+  char hdr[512];
+  uint16_t hdr_len;
+  uint8_t pending[16];         // the first stream bytes, while the de-chunker decides
+  uint8_t pending_len;
+  uint32_t last_rtcm_ms;       // last good RTCM 3 frame, or any byte for RTCM 2
+  uint32_t last_frames;
+
+  // PPS
+  int pps_pin;
+
+  // publishing
+  uint32_t last_pub_ms;
+  uint32_t last_sats_ms;
+  int hass_index;              // next discovery entity to publish; -1 when done
+  uint8_t hass_model_published;
+  uint16_t announced[GNSS_MAX_ANNOUNCED];   // per-satellite entities published: gnss << 8 | svid
+  uint8_t n_announced;
+} *Gnss = nullptr;
+
+static volatile uint32_t gnss_pps_count = 0;
+static volatile uint32_t gnss_pps_ms = 0;
 
 #ifdef USE_FLOG
 FLOG *Flog = nullptr;
@@ -336,60 +250,671 @@ WiFiServer vPortServer(UBX_TCP_PORT);
 WiFiClient vPortClient;
 
 /*********************************************************************************************\
- * helper function
+ * settings
 \*********************************************************************************************/
 
-void UBXcalcChecksum(char* CK, size_t msgSize)
-{
-  memset(CK, 0, 2);
-  for (int i = 0; i < msgSize; i++) {
-    CK[0] += ((char*)(&UBX.Message))[i];
-    CK[1] += CK[0];
+void GnssDefaults(void) {
+  memset(&Gnss->cfg, 0, sizeof(Gnss->cfg));
+  Gnss->cfg.magic = GNSS_CFG_MAGIC;
+  Gnss->cfg.period = 10;
+  Gnss->cfg.hass = 1;
+  Gnss->cfg.ntrip = 1;
+  strlcpy(Gnss->cfg.host, GNSS_NTRIP_HOST, sizeof(Gnss->cfg.host));
+  Gnss->cfg.port = GNSS_NTRIP_PORT;
+}
+
+void GnssLoadSettings(void) {
+  GnssDefaults();
+#ifdef USE_UFILESYS
+  GnssSettings loaded;
+  if (TfsLoadFile(GNSS_CFG_FILE, (uint8_t*)&loaded, sizeof(loaded)) && loaded.magic == GNSS_CFG_MAGIC) {
+    Gnss->cfg = loaded;
+    Gnss->cfg.host[sizeof(Gnss->cfg.host) - 1] = 0;
+    Gnss->cfg.mount[sizeof(Gnss->cfg.mount) - 1] = 0;
+    Gnss->cfg.user[sizeof(Gnss->cfg.user) - 1] = 0;
+    Gnss->cfg.password[sizeof(Gnss->cfg.password) - 1] = 0;
+    if (Gnss->cfg.period < 1) { Gnss->cfg.period = 10; }
+  }
+#endif  // USE_UFILESYS
+}
+
+void GnssSaveSettings(void) {
+#ifdef USE_UFILESYS
+  TfsSaveFile(GNSS_CFG_FILE, (const uint8_t*)&Gnss->cfg, sizeof(Gnss->cfg));
+#endif  // USE_UFILESYS
+}
+
+/*********************************************************************************************\
+ * receiver: search, identify, configure
+\*********************************************************************************************/
+
+void GnssWrite(const uint8_t *data, size_t len) {
+  UBXSerial->write(data, len);
+}
+
+void GnssSetBaud(uint32_t baud) {
+  UBXSerial->flush();
+  UBXSerial->begin(baud);
+  Gnss->baud = baud;
+  AddLog(LOG_LEVEL_DEBUG, PSTR("GPS: UART at %u baud"), baud);
+}
+
+void GnssStartSearch(void) {
+  gnss_stream_init(&Gnss->stream);
+  Gnss->st.module = GNSS_MODULE_UNKNOWN;
+  Gnss->st.model[0] = 0;
+  Gnss->phase = GNSS_SEARCH;
+  Gnss->phase_ms = millis();
+  Gnss->got_frame = false;
+  if (Gnss->cfg.baud) {
+    GnssSetBaud(Gnss->cfg.baud);
+  } else {
+    GnssSetBaud(kGnssBauds[Gnss->baud_index % (sizeof(kGnssBauds) / sizeof(kGnssBauds[0]))]);
   }
 }
 
-bool UBXcompareMsgHeader(const char* msgHeader)
-{
-  char* ptr = (char*)(&UBX.Message);
-  return ptr[0] == msgHeader[0] && ptr[1] == msgHeader[1];
+void GnssSendProbe(void) {
+  uint8_t out[32];
+  size_t n = gnss_module_probe(Gnss->step, out, sizeof(out));
+  if (n) { GnssWrite(out, n); }
+  Gnss->phase_ms = millis();
 }
 
-void UBXinitCFG(void)
-{
-  for (uint32_t i = 0; i < sizeof(UBLOX_INIT); i++) {
-    UBXSerial->write( pgm_read_byte(UBLOX_INIT+i) );
+void GnssIdentified(void) {
+  AddLog(LOG_LEVEL_INFO, PSTR("GPS: %s (%s, %s) at %u baud"), Gnss->st.model, Gnss->st.sw_version,
+         Gnss->st.hw_version, Gnss->baud);
+  Gnss->phase = GNSS_CONFIGURE;
+  Gnss->step = 0;
+  Gnss->phase_ms = millis() - GNSS_CMD_GAP_MS;
+  Gnss->hass_index = 0;         // republish discovery: the device model is now known
+}
+
+void GnssPhaseStep(void) {
+  uint32_t now = millis();
+  switch (Gnss->phase) {
+    case GNSS_SEARCH:
+      if (Gnss->got_frame) {
+        Gnss->phase = GNSS_PROBE;
+        Gnss->step = 0;
+        GnssSendProbe();
+      } else if (now - Gnss->phase_ms > GNSS_SEARCH_MS) {
+        Gnss->baud_index++;
+        GnssStartSearch();
+      }
+      break;
+    case GNSS_PROBE:
+      if (Gnss->st.module != GNSS_MODULE_UNKNOWN) {
+        GnssIdentified();
+      } else if (now - Gnss->phase_ms > GNSS_PROBE_MS) {
+        Gnss->step++;
+        uint8_t out[32];
+        if (gnss_module_probe(Gnss->step, out, sizeof(out))) {
+          GnssSendProbe();
+        } else {
+          AddLog(LOG_LEVEL_INFO, PSTR("GPS: receiver not identified; reading its NMEA as it is"));
+          Gnss->phase = GNSS_RUNNING;
+        }
+      }
+      break;
+    case GNSS_CONFIGURE:
+      if (now - Gnss->phase_ms >= GNSS_CMD_GAP_MS) {
+        uint8_t out[256];
+        uint32_t switch_baud = 0;
+        size_t n = gnss_module_config(Gnss->st.module, Gnss->step, out, sizeof(out), &switch_baud);
+        if (!n) {
+          Gnss->phase = GNSS_RUNNING;
+          AddLog(LOG_LEVEL_INFO, PSTR("GPS: configured"));
+          break;
+        }
+        GnssWrite(out, n);
+        if (switch_baud && switch_baud != Gnss->baud && !Gnss->cfg.baud) {
+          UBXSerial->flush();
+          delay(20);              // let the receiver act on the last byte
+          GnssSetBaud(switch_baud);
+        }
+        Gnss->step++;
+        Gnss->phase_ms = now;
+      }
+      break;
+    case GNSS_RUNNING:
+      if (now - Gnss->last_frame_ms > GNSS_SILENT_MS) {
+        AddLog(LOG_LEVEL_INFO, PSTR("GPS: receiver silent, searching again"));
+        GnssStartSearch();
+      }
+      break;
   }
-  DEBUG_SENSOR_LOG(PSTR("UBX: turn off NMEA"));
 }
 
-void UBXsendCFGLine(uint8_t _line)
-{
-  if (_line>sizeof(UBLOX_INIT)/16) return;
-  for (uint32_t i = 0; i < 16; i++) {
-    UBXSerial->write( pgm_read_byte(UBLOX_INIT+i+(_line*16)) );
+/*********************************************************************************************\
+ * PPS
+\*********************************************************************************************/
+
+void IRAM_ATTR GnssPpsIsr(void) {
+  gnss_pps_count++;
+  gnss_pps_ms = millis();
+}
+
+bool GnssPpsPresent(void) {
+  return gnss_pps_count && (millis() - gnss_pps_ms < 2000);
+}
+
+/*********************************************************************************************\
+ * NTRIP corrections
+\*********************************************************************************************/
+
+void GnssNtripStop(uint8_t state, const char *error) {
+  if (Gnss->ntrip) {
+    Gnss->ntrip->stop();
+    delete Gnss->ntrip;
+    Gnss->ntrip = nullptr;
   }
-  DEBUG_SENSOR_LOG(PSTR("UBX: send line %u of UBLOX_INIT"), _line);
+  Gnss->corr_state = state;
+  strlcpy(Gnss->corr_error, error, sizeof(Gnss->corr_error));
+  if (state == GNSS_CORR_RETRYING) {
+    Gnss->backoff_s = Gnss->backoff_s ? Gnss->backoff_s * 2 : 5;
+    if (Gnss->backoff_s > 300) { Gnss->backoff_s = 300; }
+    Gnss->next_try_ms = millis() + Gnss->backoff_s * 1000;
+    AddLog(LOG_LEVEL_INFO, PSTR("GPS: corrections: %s, retry in %u s"), error, Gnss->backoff_s);
+  }
 }
 
-/********************************************************************************************/
+const char *GnssNtripMount(void) {
+  if (Gnss->cfg.ntrip == 2) { return Gnss->cfg.mount; }
+  return gnss_module_mount(Gnss->st.module);
+}
+
+void GnssNtripConnect(void) {
+  const char *mount = GnssNtripMount();
+  if (!*mount) { return; }        // receiver not identified yet: no mountpoint to ask for
+  strlcpy(Gnss->corr_mount, mount, sizeof(Gnss->corr_mount));
+  Gnss->corr_state = GNSS_CORR_CONNECTING;
+  Gnss->ntrip = new WiFiClient();
+  if (!Gnss->ntrip->connect(Gnss->cfg.host, Gnss->cfg.port, 2000)) {
+    GnssNtripStop(GNSS_CORR_RETRYING, "cannot connect");
+    return;
+  }
+  char req[384];
+  size_t n = gnss_ntrip_request(req, sizeof(req), Gnss->cfg.host, Gnss->cfg.port, mount,
+                                Gnss->cfg.ntrip == 2 ? Gnss->cfg.user : nullptr,
+                                Gnss->cfg.ntrip == 2 ? Gnss->cfg.password : nullptr);
+  if (!n) {
+    GnssNtripStop(GNSS_CORR_RETRYING, "request too long");
+    return;
+  }
+  Gnss->ntrip->write((const uint8_t*)req, n);
+  Gnss->header_done = false;
+  Gnss->hdr_len = 0;
+  Gnss->pending_len = 0;
+  Gnss->next_try_ms = millis() + 10000;   // the caster has 10 s to answer
+  AddLog(LOG_LEVEL_INFO, PSTR("GPS: corrections: requesting %s:%u/%s"), Gnss->cfg.host, Gnss->cfg.port, mount);
+}
+
+/* Correction bytes, header and chunk framing removed: to the receiver. */
+void GnssCorrections(uint8_t *data, size_t len) {
+  if (!len) { return; }
+  uint32_t frames = gnss_rtcm_feed(&Gnss->rtcm, data, len);
+  // RTCM 3 is alive when frames check out; a stream that has never framed (RTCM 2.3) on any data.
+  if (frames || Gnss->rtcm.frames == 0) { Gnss->last_rtcm_ms = millis(); }
+  if (Gnss->phase == GNSS_RUNNING) { GnssWrite(data, len); }
+}
+
+/* Stream bytes after the header: hold the first few until the de-chunker can decide. */
+void GnssStreamBytes(uint8_t *data, size_t len) {
+  if (!Gnss->dechunk.decided) {
+    size_t room = sizeof(Gnss->pending) - Gnss->pending_len;
+    size_t take = len < room ? len : room;
+    memcpy(Gnss->pending + Gnss->pending_len, data, take);
+    Gnss->pending_len += take;
+    data += take;
+    len -= take;
+    size_t n = gnss_dechunk(&Gnss->dechunk, Gnss->pending, Gnss->pending_len);
+    if (!Gnss->dechunk.decided) { return; }
+    if (Gnss->dechunk.active) {
+      AddLog(LOG_LEVEL_DEBUG, PSTR("GPS: corrections: stripping HTTP chunk framing"));
+    }
+    GnssCorrections(Gnss->pending, n);
+    Gnss->pending_len = 0;
+  }
+  GnssCorrections(data, gnss_dechunk(&Gnss->dechunk, data, len));
+}
+
+void GnssNtripLoop(void) {
+  if (!Gnss->ntrip) { return; }
+  if (!Gnss->ntrip->connected() && !Gnss->ntrip->available()) {
+    GnssNtripStop(GNSS_CORR_RETRYING, "disconnected");
+    return;
+  }
+  uint8_t buf[512];
+  int avail = Gnss->ntrip->available();
+  if (avail <= 0) {
+    if (!Gnss->header_done && TimeReached(Gnss->next_try_ms)) {
+      GnssNtripStop(GNSS_CORR_RETRYING, "no reply");
+    }
+    return;
+  }
+  int n = Gnss->ntrip->read(buf, avail < (int)sizeof(buf) ? avail : sizeof(buf));
+  if (n <= 0) { return; }
+  if (Gnss->header_done) {
+    GnssStreamBytes(buf, n);
+    return;
+  }
+  size_t room = sizeof(Gnss->hdr) - Gnss->hdr_len;
+  size_t take = (size_t)n < room ? n : room;
+  memcpy(Gnss->hdr + Gnss->hdr_len, buf, take);
+  Gnss->hdr_len += take;
+  size_t header_len;
+  bool chunked;
+  switch (gnss_ntrip_reply(Gnss->hdr, Gnss->hdr_len, &header_len, &chunked)) {
+    case GNSS_NTRIP_INCOMPLETE:
+      if (Gnss->hdr_len == sizeof(Gnss->hdr)) { GnssNtripStop(GNSS_CORR_RETRYING, "reply header too long"); }
+      return;
+    case GNSS_NTRIP_SOURCETABLE:
+      GnssNtripStop(GNSS_CORR_RETRYING, "mountpoint unknown or down");
+      return;
+    case GNSS_NTRIP_UNAUTHORIZED:
+      GnssNtripStop(GNSS_CORR_RETRYING, "login refused");
+      return;
+    case GNSS_NTRIP_ERROR:
+      GnssNtripStop(GNSS_CORR_RETRYING, "caster error");
+      return;
+    case GNSS_NTRIP_OK:
+      break;
+  }
+  Gnss->header_done = true;
+  Gnss->corr_state = GNSS_CORR_CONNECTED;
+  Gnss->corr_error[0] = 0;
+  Gnss->backoff_s = 0;
+  gnss_dechunk_init(&Gnss->dechunk, chunked);
+  AddLog(LOG_LEVEL_INFO, PSTR("GPS: corrections: streaming %s"), Gnss->corr_mount);
+  // whatever followed the header, in this read and in the header buffer
+  size_t after = Gnss->hdr_len - header_len;
+  uint8_t rest[sizeof(Gnss->hdr)];
+  memcpy(rest, Gnss->hdr + header_len, after);
+  GnssStreamBytes(rest, after);
+  if (take < (size_t)n) { GnssStreamBytes(buf + take, n - take); }
+}
+
+void GnssNtripEverySecond(void) {
+  bool wanted = Gnss->cfg.ntrip != 0 && Gnss->phase == GNSS_RUNNING && *GnssNtripMount() &&
+                !TasmotaGlobal.global_state.network_down;
+  if (!wanted) {
+    if (Gnss->ntrip || Gnss->corr_state != GNSS_CORR_DISABLED) {
+      GnssNtripStop(GNSS_CORR_DISABLED, "");
+    }
+    return;
+  }
+  if (!Gnss->ntrip && (Gnss->corr_state != GNSS_CORR_RETRYING || TimeReached(Gnss->next_try_ms))) {
+    GnssNtripConnect();
+  }
+  // A stream that stops delivering corrections is reconnected.
+  if (Gnss->ntrip && Gnss->header_done && Gnss->last_rtcm_ms && millis() - Gnss->last_rtcm_ms > 60000) {
+    GnssNtripStop(GNSS_CORR_RETRYING, "no corrections for 60 s");
+  }
+}
+
+/*********************************************************************************************\
+ * frames from the receiver
+\*********************************************************************************************/
+
+/* The Arduino build declares every .ino function at the top of the merged
+ * file, before the gnss_*.h types exist, so functions here take only types
+ * declared that early: an integer frame type, void pointers for structs. */
+void GnssFrame(uint32_t t) {
+  switch (t) {
+    case GNSS_FRAME_NMEA:
+      gnss_nmea_parse(&Gnss->st, (const char*)Gnss->stream.buf);
+      break;
+    case GNSS_FRAME_UBX:
+      gnss_ubx_parse(&Gnss->st, Gnss->stream.buf[0], Gnss->stream.buf[1], Gnss->stream.buf + 4, Gnss->stream.ubx_len);
+      break;
+    case GNSS_FRAME_BAD_NMEA:
+      Gnss->st.nmea_bad++;
+      return;
+    case GNSS_FRAME_BAD_UBX:
+      Gnss->st.ubx_bad++;
+      return;
+    default:
+      return;
+  }
+  Gnss->last_frame_ms = millis();
+  Gnss->got_frame = true;
+}
+
+void UBXSelectMode(uint16_t mode);
+
+/* Once per navigation epoch: the legacy features fed from the new state. */
+void GnssNewEpoch(void) {
+  gnss_state_t *s = &Gnss->st;
+  UBX.state.timeOffset = millis();      // the NTP server's reference for this second
+  if (s->position_valid && s->fix_type >= GNSS_FIX_2D) {
+    bool moved = true;
+    if (UBX.mode.filter_noise) {
+      moved = abs(s->lat_e7 - UBX.rec_buffer.values.lat) >= UBX_LAT_LON_THRESHOLD &&
+              abs(s->lon_e7 - UBX.rec_buffer.values.lon) >= UBX_LAT_LON_THRESHOLD;
+    }
+    if (moved) {
+      UBX.rec_buffer.values.lat = s->lat_e7;
+      UBX.rec_buffer.values.lon = s->lon_e7;
+      if (UBX.mode.send_when_new) { MqttPublishTeleperiodSensor(); }
+    }
+  }
+  if (s->time_valid && s->date_valid && s->year >= 2023) {
+    bool resync = (Rtc.utc_time > UBX.utc_time);  // Sync local time every hour
+    if (Rtc.user_time_entry == false || UBX.mode.forceUTCupdate || UBX.mode.runningNTP || resync) {
+      TIME_T gpsTime;
+      gpsTime.year = s->year - 1970;
+      gpsTime.month = s->month;
+      gpsTime.day_of_month = s->day;
+      gpsTime.hour = s->hour;
+      gpsTime.minute = s->minute;
+      gpsTime.second = s->second;
+      UBX.rec_buffer.values.time = MakeTime(gpsTime);
+      if (UBX.mode.forceUTCupdate || (Rtc.user_time_entry == false) || resync) {
+        UBX.utc_time = UBX.rec_buffer.values.time + 3600;
+        Rtc.utc_time = UBX.rec_buffer.values.time;
+        RtcSync("GPS");
+      }
+      Rtc.user_time_entry = true;
+    }
+  }
+}
+
+/* Called from FUNC_LOOP: drain the UART as fast as it fills. */
+void GnssLoop(void) {
+  uint32_t n = 0;
+  while (UBXSerial->available() && n < 1024) {
+    uint8_t c = UBXSerial->read();
+    if (UBX.mode.runningVPort && UBX.TCPbufSize < sizeof(UBX.TCPbuf)) {
+      UBX.TCPbuf[UBX.TCPbufSize++] = c;   // the virtual serial port gets every byte
+    }
+    gnss_frame_t t = gnss_stream_byte(&Gnss->stream, c);
+    if (t != GNSS_FRAME_NONE) { GnssFrame(t); }
+    n++;
+  }
+  if (Gnss->st.epoch != Gnss->last_epoch) {
+    Gnss->last_epoch = Gnss->st.epoch;
+    GnssNewEpoch();
+  }
+  GnssPhaseStep();
+  GnssNtripLoop();
+}
+
+/*********************************************************************************************\
+ * MQTT and Home Assistant
+\*********************************************************************************************/
+
+void GnssExtra(void *xp) {
+  gnss_extra_t *x = (gnss_extra_t*)xp;
+  memset(x, 0, sizeof(*x));
+  x->corr_state = Gnss->corr_state;
+  x->corr_mount = Gnss->corr_state == GNSS_CORR_DISABLED ? "" : Gnss->corr_mount;
+  x->corr_error = Gnss->corr_error;
+  x->rtcm = &Gnss->rtcm;
+  x->corr_age_s = Gnss->last_rtcm_ms ? (int32_t)((millis() - Gnss->last_rtcm_ms) / 1000) : -1;
+  x->baud = Gnss->baud;
+  x->pps_present = GnssPpsPresent();
+  x->pps_count = gnss_pps_count;
+  x->data_age_s = Gnss->last_frame_ms ? (int32_t)((millis() - Gnss->last_frame_ms) / 1000) : -1;
+}
+
+void GnssPublishState(void) {
+  char *buf = (char*)malloc(2048);
+  if (!buf) { return; }
+  gnss_extra_t x;
+  GnssExtra(&x);
+  if (gnss_json_state(buf, 2048, &Gnss->st, &x)) {
+    MqttPublishPayloadPrefixTopic_P(TELE, PSTR("GNSS"), buf);
+  }
+  free(buf);
+}
+
+void GnssPublishSats(void) {
+  char *buf = (char*)malloc(4096);
+  if (!buf) { return; }
+  if (gnss_json_sats(buf, 4096, &Gnss->st)) {
+    MqttPublishPayloadPrefixTopic_P(TELE, PSTR("GNSS_SATS"), buf);
+  }
+  free(buf);
+}
+
+struct GnssDevice {
+  char uid[24];
+  char topic[TOPSZ];
+  char lwt[TOPSZ];
+  char sw[48];
+  char url[32];
+  gnss_hass_device_t dev;
+};
+
+void GnssDeviceInfo(void *dp) {
+  GnssDevice *d = (GnssDevice*)dp;
+  snprintf_P(d->uid, sizeof(d->uid), PSTR("gps_%s"), NetworkUniqueId().c_str());
+  GetTopic_P(d->topic, TELE, TasmotaGlobal.mqtt_topic, "");
+  GetTopic_P(d->lwt, TELE, TasmotaGlobal.mqtt_topic, S_LWT);
+  snprintf_P(d->sw, sizeof(d->sw), PSTR("%s (%s)"), TasmotaGlobal.version, TasmotaGlobal.image_name);
+  snprintf_P(d->url, sizeof(d->url), PSTR("http://%s/"), NetworkAddress().toString().c_str());
+  d->dev.uid = d->uid;
+  d->dev.name = SettingsText(SET_DEVICENAME);
+  d->dev.topic = d->topic;
+  d->dev.lwt = d->lwt;
+  d->dev.model = Gnss->st.model;
+  d->dev.sw = d->sw;
+  d->dev.url = d->url;
+}
+
+/* A few discovery messages at a time, so MQTT is never flooded. */
+void GnssHassStep(void) {
+  if (!Gnss->cfg.hass || Gnss->hass_index < 0 || !MqttIsConnected()) { return; }
+  GnssDevice *d = (GnssDevice*)malloc(sizeof(GnssDevice));
+  char *payload = (char*)malloc(1024);
+  if (d && payload) {
+    GnssDeviceInfo(d);
+    char topic[160];
+    for (int i = 0; i < 3 && Gnss->hass_index >= 0; i++) {
+      if (gnss_hass_config(Gnss->hass_index, &d->dev, topic, sizeof(topic), payload, 1024)) {
+        MqttPublishPayload(topic, payload, 0, true);
+      }
+      if (++Gnss->hass_index >= gnss_hass_count()) { Gnss->hass_index = -1; }
+    }
+  }
+  free(payload);
+  free(d);
+}
+
+int GnssAnnounced(uint16_t key) {
+  for (uint8_t i = 0; i < Gnss->n_announced; i++) {
+    if (Gnss->announced[i] == key) { return i; }
+  }
+  return -1;
+}
+
+/* Per-satellite entities: announce new satellites, a few per second; remove them all when switched off. */
+void GnssSatEntitiesStep(void) {
+  if (!MqttIsConnected()) { return; }
+  bool want = Gnss->cfg.hass && Gnss->cfg.sat_entities;
+  if (!want && !Gnss->n_announced) { return; }
+  GnssDevice *d = (GnssDevice*)malloc(sizeof(GnssDevice));
+  char *payload = (char*)malloc(1024);
+  if (d && payload) {
+    GnssDeviceInfo(d);
+    char topic[160];
+    uint8_t sent = 0;
+    if (!want) {
+      while (Gnss->n_announced && sent < 4) {
+        uint16_t key = Gnss->announced[--Gnss->n_announced];
+        gnss_hass_sat_config(key >> 8, key & 0xff, true, &d->dev, topic, sizeof(topic), payload, 1024);
+        MqttPublishPayload(topic, "", 0, true);
+        sent++;
+      }
+    } else {
+      for (uint8_t i = 0; i < Gnss->st.n_sats && sent < 4 && Gnss->n_announced < GNSS_MAX_ANNOUNCED; i++) {
+        uint16_t key = Gnss->st.sats[i].gnss << 8 | Gnss->st.sats[i].svid;
+        if (GnssAnnounced(key) >= 0) { continue; }
+        if (gnss_hass_sat_config(key >> 8, key & 0xff, false, &d->dev, topic, sizeof(topic), payload, 1024)) {
+          MqttPublishPayload(topic, payload, 0, true);
+          Gnss->announced[Gnss->n_announced++] = key;
+          sent++;
+        }
+      }
+    }
+  }
+  free(payload);
+  free(d);
+}
+
+void GnssEverySecond(void) {
+  GnssNtripEverySecond();
+  if (!MqttIsConnected()) { return; }
+  uint32_t now = millis();
+  if (now - Gnss->last_pub_ms >= (uint32_t)Gnss->cfg.period * 1000) {
+    Gnss->last_pub_ms = now;
+    GnssPublishState();
+  }
+  if (now - Gnss->last_sats_ms >= 30000) {
+    Gnss->last_sats_ms = now;
+    GnssPublishSats();
+  }
+  GnssSatEntitiesStep();
+}
+
+/*********************************************************************************************\
+ * Gps* commands
+\*********************************************************************************************/
+
+const char kGnssCommands[] PROGMEM = "Gps|"
+  "Baud|Ntrip|Period|SatEntities|Hass|Reinit|Status";
+
+void (* const GnssCommand[])(void) PROGMEM = {
+  &CmndGpsBaud, &CmndGpsNtrip, &CmndGpsPeriod, &CmndGpsSatEntities, &CmndGpsHass, &CmndGpsReinit, &CmndGpsStatus };
+
+void CmndGpsBaud(void) {
+  if (XdrvMailbox.data_len > 0) {
+    uint32_t baud = XdrvMailbox.payload;
+    if (baud == 0 || baud == 9600 || baud == 19200 || baud == 38400 || baud == 57600 || baud == 115200 || baud == 230400) {
+      Gnss->cfg.baud = baud;
+      GnssSaveSettings();
+      GnssStartSearch();
+    }
+  }
+  ResponseCmndNumber(Gnss->cfg.baud);
+}
+
+void CmndGpsNtrip(void) {
+  if (XdrvMailbox.data_len > 0) {
+    if (XdrvMailbox.data_len == 1 && (XdrvMailbox.payload == 0 || XdrvMailbox.payload == 1)) {
+      Gnss->cfg.ntrip = XdrvMailbox.payload;
+      strlcpy(Gnss->cfg.host, GNSS_NTRIP_HOST, sizeof(Gnss->cfg.host));
+      Gnss->cfg.port = GNSS_NTRIP_PORT;
+      Gnss->cfg.mount[0] = Gnss->cfg.user[0] = Gnss->cfg.password[0] = 0;
+    } else {
+      // <host>:<port>/<mount>[ <user> <password>]
+      char arg[160];
+      strlcpy(arg, XdrvMailbox.data, sizeof(arg));
+      char *user = strchr(arg, ' ');
+      char *password = nullptr;
+      if (user) { *user++ = 0; password = strchr(user, ' '); if (password) { *password++ = 0; } }
+      char *mount = strchr(arg, '/');
+      char *port = strchr(arg, ':');
+      if (!mount || !port || port > mount) {
+        ResponseCmndChar_P(PSTR("Use <host>:<port>/<mount>[ <user> <password>]"));
+        return;
+      }
+      *mount++ = 0;
+      *port++ = 0;
+      Gnss->cfg.ntrip = 2;
+      strlcpy(Gnss->cfg.host, arg, sizeof(Gnss->cfg.host));
+      Gnss->cfg.port = atoi(port);
+      strlcpy(Gnss->cfg.mount, mount, sizeof(Gnss->cfg.mount));
+      strlcpy(Gnss->cfg.user, user ? user : "", sizeof(Gnss->cfg.user));
+      strlcpy(Gnss->cfg.password, password ? password : "", sizeof(Gnss->cfg.password));
+    }
+    GnssSaveSettings();
+    GnssNtripStop(GNSS_CORR_DISABLED, "");   // reconnects next second with the new settings
+  }
+  if (Gnss->cfg.ntrip == 0) {
+    ResponseCmndChar_P(PSTR("0"));
+  } else {
+    char out[128];
+    snprintf_P(out, sizeof(out), PSTR("%s:%u/%s"), Gnss->cfg.host, Gnss->cfg.port, GnssNtripMount());
+    ResponseCmndChar(out);
+  }
+}
+
+void CmndGpsPeriod(void) {
+  if (XdrvMailbox.data_len > 0 && XdrvMailbox.payload >= 1 && XdrvMailbox.payload <= 3600) {
+    Gnss->cfg.period = XdrvMailbox.payload;
+    GnssSaveSettings();
+  }
+  ResponseCmndNumber(Gnss->cfg.period);
+}
+
+void CmndGpsSatEntities(void) {
+  if (XdrvMailbox.data_len > 0 && XdrvMailbox.payload <= 1) {
+    Gnss->cfg.sat_entities = XdrvMailbox.payload;
+    GnssSaveSettings();
+  }
+  ResponseCmndStateText(Gnss->cfg.sat_entities);
+}
+
+void CmndGpsHass(void) {
+  if (XdrvMailbox.data_len > 0 && XdrvMailbox.payload <= 1) {
+    Gnss->cfg.hass = XdrvMailbox.payload;
+    GnssSaveSettings();
+    Gnss->hass_index = 0;
+  }
+  ResponseCmndStateText(Gnss->cfg.hass);
+}
+
+void CmndGpsReinit(void) {
+  GnssStartSearch();
+  ResponseCmndDone();
+}
+
+void CmndGpsStatus(void) {
+  char *buf = (char*)malloc(2048);
+  if (!buf) { return; }
+  gnss_extra_t x;
+  GnssExtra(&x);
+  if (gnss_json_state(buf, 2048, &Gnss->st, &x)) {
+    Response_P(PSTR("{\"%s\":%s}"), XdrvMailbox.command, buf);
+  }
+  free(buf);
+}
+
+/*********************************************************************************************\
+ * set-up
+\*********************************************************************************************/
 
 void UBXDetect(void) {
   UBX.mode.init = 0;
   if (!(PinUsed(GPIO_GPS_RX, GPIO_ANY) && PinUsed(GPIO_GPS_TX))) { return; }
 
-  uint32_t option = GetPin(Pin(GPIO_GPS_RX, GPIO_ANY)) - AGPIO(GPIO_GPS_RX);  // 0 .. 2
-  uint32_t baudrate = 9600 << option;  // Support 1 (9600), 2 (19200), 3 (38400)
-  UBXSerial = new TasmotaSerial(Pin(GPIO_GPS_RX, GPIO_ANY), Pin(GPIO_GPS_TX), 1, 0, UBX_SERIAL_BUFFER_SIZE); // 64 byte buffer is NOT enough
-  if (!UBXSerial->begin(baudrate)) { return; }
+  Gnss = new GNSS_t();
+  if (!Gnss) { return; }
+  memset(Gnss, 0, sizeof(GNSS_t));
+  gnss_state_init(&Gnss->st);
+  gnss_rtcm_init(&Gnss->rtcm);
+  Gnss->hass_index = 0;
+  Gnss->pps_pin = -1;
+  GnssLoadSettings();
+
+  UBXSerial = new TasmotaSerial(Pin(GPIO_GPS_RX, GPIO_ANY), Pin(GPIO_GPS_TX), 1, 0, UBX_SERIAL_BUFFER_SIZE);
+  if (!UBXSerial->begin(Gnss->cfg.baud ? Gnss->cfg.baud : kGnssBauds[0])) { return; }
 
   if (UBXSerial->hardwareSerial()) {
     ClaimSerial();
   }
 #ifdef ESP32
-  AddLog(LOG_LEVEL_DEBUG, PSTR("UBX: Serial UART%d"), UBXSerial->getUart());
+  AddLog(LOG_LEVEL_DEBUG, PSTR("GPS: Serial UART%d"), UBXSerial->getUart());
 #endif
 
-  UBXinitCFG();                 // turn off NMEA, only use "our" UBX-messages
+  if (PinUsed(GPIO_GPS_PPS)) {
+    Gnss->pps_pin = Pin(GPIO_GPS_PPS);
+    pinMode(Gnss->pps_pin, INPUT);
+    attachInterrupt(Gnss->pps_pin, GnssPpsIsr, RISING);
+  }
+
+  GnssStartSearch();
   UBX.mode.init = 1;
 
 #ifdef USE_FLOG
@@ -401,112 +926,6 @@ void UBXDetect(void) {
 
   UBX.state.log_interval = 10;  // 1 second
   UBX.mode.send_UI_only = true; // send UI data ...
-//  MqttPublishTeleperiodSensor();  // ... once at after start (No MQTT ready yet so do NOT try to send)
-}
-
-uint32_t UBXprocessGPS()
-{
-  static uint32_t fpos = 0;
-  static char checksum[2];
-  static uint8_t currentMsgType = MT_NONE;
-  static size_t payloadSize = sizeof(UBX.Message);
-
-  // DEBUG_SENSOR_LOG(PSTR("UBX: check for serial data"));
-  uint32_t data_bytes = 0;
-  while ( UBXSerial->available() ) {
-    data_bytes++;
-    byte c = UBXSerial->read();
-    if (UBX.mode.runningVPort){
-      UBX.TCPbuf[data_bytes-1] = c; // immediately copy byte to TCP-buf
-      UBX.TCPbufSize = data_bytes;
-    }
-    if ( fpos < 2 ) {
-      // For the first two bytes we are simply looking for a match with the UBX header bytes (0xB5,0x62)
-      if ( c == UBX.UBX_HEADER[fpos] ) {
-        fpos++;
-      } else {
-        fpos = 0; // Reset to beginning state.
-      }
-    } else {
-      // If we come here then fpos >= 2, which means we have found a match with the UBX_HEADER
-      // and we are now reading in the bytes that make up the payload.
-
-      // Place the incoming byte into the ubxMessage struct. The position is fpos-2 because
-      // the struct does not include the initial two-byte header (UBX_HEADER).
-      if ( (fpos-2) < payloadSize ) {
-        ((char*)(&UBX.Message))[fpos-2] = c;
-      }
-      fpos++;
-
-      if ( fpos == 4 ) {
-        // We have just received the second byte of the message type header,
-        // so now we can check to see what kind of message it is.
-        if ( UBXcompareMsgHeader(UBX.NAV_POSLLH_HEADER) ) {
-          currentMsgType = MT_NAV_POSLLH;
-          payloadSize = sizeof(UBX_t::NAV_POSLLH);
-          DEBUG_SENSOR_LOG(PSTR("UBX: got NAV_POSLLH"));
-        }
-        else if ( UBXcompareMsgHeader(UBX.NAV_STATUS_HEADER) ) {
-          currentMsgType = MT_NAV_STATUS;
-          payloadSize = sizeof(UBX_t::NAV_STATUS);
-          DEBUG_SENSOR_LOG(PSTR("UBX: got NAV_STATUS"));
-        }
-        else if ( UBXcompareMsgHeader(UBX.NAV_TIME_HEADER) ) {
-          currentMsgType = MT_NAV_TIME;
-          payloadSize = sizeof(UBX_t::NAV_TIME_UTC);
-          DEBUG_SENSOR_LOG(PSTR("UBX: got NAV_TIME_UTC"));
-        }
-#ifdef USE_GPS_VELOCITY
-        else if ( UBXcompareMsgHeader(UBX.NAV_VEL_HEADER) ) {
-          currentMsgType = MT_NAV_VEL;
-          payloadSize = sizeof(UBX_t::NAV_VEL);
-          DEBUG_SENSOR_LOG(PSTR("UBX: got NAV_VEL"));
-        }
-#endif  // USE_GPS_VELOCITY
-        else {
-          // unknown message type, bail
-          fpos = 0;
-          continue;
-        }
-      }
-
-      if ( fpos == (payloadSize+2) ) {
-        // All payload bytes have now been received, so we can calculate the
-        // expected checksum value to compare with the next two incoming bytes.
-        UBXcalcChecksum(checksum, payloadSize);
-      }
-      else if ( fpos == (payloadSize+3) ) {
-        // First byte after the payload, ie. first byte of the checksum.
-        // Does it match the first byte of the checksum we calculated?
-        if ( c != checksum[0] ) {
-          // Checksum doesn't match, reset to beginning state and try again.
-          fpos = 0;
-        }
-      }
-      else if ( fpos == (payloadSize+4) ) {
-        // Second byte after the payload, ie. second byte of the checksum.
-        // Does it match the second byte of the checksum we calculated?
-        fpos = 0; // We will reset the state regardless of whether the checksum matches.
-        if ( c == checksum[1] ) {
-          // Checksum matches, we have a valid message.
-          return currentMsgType;
-        }
-      }
-      else if ( fpos > (payloadSize+4) ) {
-        // We have now read more bytes than both the expected payload and checksum
-        // together, so something went wrong. Reset to beginning state and try again.
-        fpos = 0;
-      }
-    }
-  }
-  // DEBUG_SENSOR_LOG(PSTR("UBX: got none or unknown Message"));
-  if (data_bytes!=0) {
-    UBX.state.non_empty_loops++;
-    DEBUG_SENSOR_LOG(PSTR("UBX: got %u bytes, non-empty-loop: %u"), data_bytes, UBX.state.non_empty_loops);
-  } else {
-    UBX.state.non_empty_loops = 0; // now a hidden GPS-device reset is unlikely
-  }
-  return MT_NONE;
 }
 
 /********************************************************************************************\
@@ -537,7 +956,6 @@ void UBXsendRecord(uint8_t *buf)
 	dtostrfd((double)entry->lat/10000000.0f,7,lat);
 	dtostrfd((double)entry->lon/10000000.0f,7,lon);
 	snprintf_P(record, sizeof(record),PSTR("<trkpt\n\t lat=\"%s\" lon=\"%s\">\n\t<time>%s</time>\n</trkpt>\n"),lat ,lon, stime);
-	// DEBUG_SENSOR_LOG(PSTR("FLOG: DL %u %u"), Flog->sector.dword_buffer[k+j],Flog->sector.dword_buffer[k+j+1]);
 	Webserver->sendContent_P(record);
 }
 
@@ -559,26 +977,18 @@ void UBXsendFile(void)
 
 /********************************************************************************************/
 
+/* Legacy UBX CFG-RATE (u-blox 7, M8): measurement interval in seconds. */
 void UBXSetRate(uint16_t interval)
 {
-  UBX.Message.cfgRate.cls = 0x06;
-  UBX.Message.cfgRate.id = 0x08;
-  UBX.Message.cfgRate.len = 6;
   uint32_t measRate = (1000*(uint32_t)interval); //seconds to milliseconds
   if (measRate > 0xffff) {
     measRate = 0xffff; // max. 65535 ms interval
   }
-  UBX.Message.cfgRate.measRate = (uint16_t)measRate;
-  UBX.Message.cfgRate.navRate = 1;
-  UBX.Message.cfgRate.timeRef = 1;
-  UBXcalcChecksum(UBX.Message.cfgRate.CK, sizeof(UBX.Message.cfgRate)-sizeof(UBX.Message.cfgRate.CK));
-  DEBUG_SENSOR_LOG(PSTR("UBX: requested interval: %u seconds measRate: %u ms"), interval, UBX.Message.cfgRate.measRate);
-  UBXSerial->write(UBX.UBX_HEADER[0]);
-  UBXSerial->write(UBX.UBX_HEADER[1]);
-  for (uint32_t i =0; i<sizeof(UBX.Message.cfgRate); i++) {
-    UBXSerial->write(((uint8_t*)(&UBX.Message.cfgRate))[i]);
-    DEBUG_SENSOR_LOG(PSTR("UBX: cfgRate byte %u: %x"), i, ((uint8_t*)(&UBX.Message.cfgRate))[i]);
-  }
+  uint8_t payload[6] = {(uint8_t)measRate, (uint8_t)(measRate >> 8), 1, 0, 1, 0};  // navRate 1, timeRef GPS
+  uint8_t out[16];
+  size_t n = gnss_ubx_frame(out, sizeof(out), 0x06, 0x08, payload, sizeof(payload));
+  GnssWrite(out, n);
+  DEBUG_SENSOR_LOG(PSTR("UBX: requested interval: %u seconds measRate: %u ms"), interval, measRate);
   UBX.state.log_interval = 10*interval;
 }
 
@@ -627,14 +1037,6 @@ void UBXSelectMode(uint16_t mode)
       break;
     case 10:
       UBX.mode.runningNTP = false;
-#ifdef USE_GPS_VELOCITY
-      UBXsendCFGLine(11); //NAV-POSLLH on
-      UBXsendCFGLine(12); //NAV-STATUS on
-      UBXsendCFGLine(14); //NAV-VELNED on
-#else
-      UBXsendCFGLine(10); //NAV-POSLLH on
-      UBXsendCFGLine(11); //NAV-STATUS on
-#endif  // USE_GPS_VELOCITY
       break;
     case 11:
       UBX.mode.forceUTCupdate = true;
@@ -666,105 +1068,6 @@ void UBXSelectMode(uint16_t mode)
 
 /********************************************************************************************/
 
-bool UBXHandlePOSLLH()
-{
-  DEBUG_SENSOR_LOG(PSTR("UBX: iTOW: %u"),UBX.Message.navPosllh.iTOW);
-  if (UBX.state.gpsFix>1) {
-    if (UBX.mode.filter_noise) {
-      if ((abs(UBX.Message.navPosllh.lat-UBX.rec_buffer.values.lat)<UBX_LAT_LON_THRESHOLD)||(abs(UBX.Message.navPosllh.lon-UBX.rec_buffer.values.lon)<UBX_LAT_LON_THRESHOLD)) {
-        DEBUG_SENSOR_LOG(PSTR("UBX: Diff lat: %u lon: %u "),UBX.Message.navPosllh.lat-UBX.rec_buffer.values.lat, UBX.Message.navPosllh.lon-UBX.rec_buffer.values.lon);
-        return false; //no new position
-      }
-    }
-    UBX.rec_buffer.values.lat = UBX.Message.navPosllh.lat;
-    UBX.rec_buffer.values.lon = UBX.Message.navPosllh.lon;
-    DEBUG_SENSOR_LOG(PSTR("UBX: lat/lon: %i / %i"), UBX.rec_buffer.values.lat, UBX.rec_buffer.values.lon);
-    DEBUG_SENSOR_LOG(PSTR("UBX: hAcc: %d"), UBX.Message.navPosllh.hAcc);
-    UBX.state.last_alt = UBX.Message.navPosllh.alt;
-    UBX.state.last_vAcc = UBX.Message.navPosllh.vAcc;
-    UBX.state.last_hAcc = UBX.Message.navPosllh.hAcc;
-    if (UBX.mode.send_when_new) {
-      MqttPublishTeleperiodSensor();
-    }
-    if (UBX.mode.runningNTP){ // after receiving pos-data at least once -> go to pure NTP-mode
-      UBXsendCFGLine(7);      // NAV-POSLLH off
-      UBXsendCFGLine(8);      // NAV-STATUS off
-#ifdef USE_GPS_VELOCITY
-      UBXsendCFGLine(10);     // NAV-VELNED off
-#endif  // USE_GPS_VELOCITY
-    }
-    //UBX_LAT_LON_THRESHOLD = 20 * UBX.Message.navPosllh.hAcc;
-    return true; // new position
-  } else {
-    DEBUG_SENSOR_LOG(PSTR("UBX: no valid position data"));
-  }
-  return false; // no GPS-fix
-}
-
-#ifdef USE_GPS_VELOCITY
-void UBXHandleVEL()
-  {
-    DEBUG_SENSOR_LOG(PSTR("UBX: iTOWvel: %u"),UBX.Message.navVel.iTOW);
-    if (UBX.state.gpsFix>1) {
-      DEBUG_SENSOR_LOG(PSTR("UBX: speed: %d"), UBX.Message.navVel.gSpeed);
-      DEBUG_SENSOR_LOG(PSTR("UBX: heading: %i"), UBX.Message.navVel.heading);
-      DEBUG_SENSOR_LOG(PSTR("UBX: spd accuracy: %i"), UBX.Message.navVel.sAcc);
-      DEBUG_SENSOR_LOG(PSTR("UBX: hdng accuracy: %i"), UBX.Message.navVel.cAcc);
-    }
-  
-}
-#endif  // USE_GPS_VELOCITY
-
-void UBXHandleSTATUS()
-{
-  DEBUG_SENSOR_LOG(PSTR("UBX: gpsFix: %u, valid: %u"), UBX.Message.navStatus.gpsFix, (UBX.Message.navStatus.flags)&1);
-  if ((UBX.Message.navStatus.flags)&1) {
-    UBX.state.gpsFix = UBX.Message.navStatus.gpsFix; //only store fixed status if flag is valid
-  } else {
-    UBX.state.gpsFix = 0; // without valid flag, everything is "no fix"
-  }
-}
-
-void UBXHandleTIME()
-{
-  DEBUG_SENSOR_LOG(PSTR("UBX: UTC-Time: %u-%u-%u %u:%u:%u"), UBX.Message.navTime.year, UBX.Message.navTime.month ,UBX.Message.navTime.day,UBX.Message.navTime.hour,UBX.Message.navTime.min,UBX.Message.navTime.sec);
- if ((UBX.Message.navTime.valid.UTC == 1) && (UBX.Message.navTime.year >= 2023)) {
-    UBX.state.timeOffset =  millis(); // iTOW%1000 should be 0 here, when NTP-server is enabled and in "pure mode"
-    DEBUG_SENSOR_LOG(PSTR("UBX: UTC-Time is valid"));
-    bool resync = (Rtc.utc_time > UBX.utc_time);  // Sync local time every hour
-    if (Rtc.user_time_entry == false || UBX.mode.forceUTCupdate || UBX.mode.runningNTP || resync) {
-      TIME_T gpsTime;
-      gpsTime.year = UBX.Message.navTime.year - 1970;
-      gpsTime.month = UBX.Message.navTime.month;
-      gpsTime.day_of_month = UBX.Message.navTime.day;
-      gpsTime.hour = UBX.Message.navTime.hour;
-      gpsTime.minute = UBX.Message.navTime.min;
-      gpsTime.second = UBX.Message.navTime.sec;
-      UBX.rec_buffer.values.time = MakeTime(gpsTime);
-      if (UBX.mode.forceUTCupdate || (Rtc.user_time_entry == false) || resync) {
-//        AddLog(LOG_LEVEL_INFO, PSTR("UBX: UTC-Time is valid, set system time"));
-        UBX.utc_time = UBX.rec_buffer.values.time + 3600;
-        Rtc.utc_time = UBX.rec_buffer.values.time;
-        RtcSync("UBX");
-      }
-      Rtc.user_time_entry = true;
-    }
-  }
-}
-
-void UBXHandleOther(void)
-{
-  if (UBX.state.non_empty_loops>6) {  // we expect only 4-5 non-empty loops in a row, could change with other sensor speed (Hz)
-    if(UBX.mode.runningVPort) return;
-    UBXinitCFG();                     // this should only happen with lots of NMEA-messages, but it is only a guess!!
-    AddLog(LOG_LEVEL_ERROR, PSTR("UBX: possible device-reset, will re-init"));
-    UBXSerial->flush();
-    UBX.state.non_empty_loops = 0;
-  }
-}
-
-/********************************************************************************************/
-
 void UBXLoop50msec(void)
 {
   // handle virtual serial port
@@ -791,33 +1094,10 @@ void UBXLoop50msec(void)
 void UBXLoop(void)
 {
   static uint16_t counter; //count up every 100 msec
-  static bool new_position;
-
-  uint32_t msgType = UBXprocessGPS();
-
-  switch(msgType){
-    case MT_NAV_POSLLH:
-      new_position = UBXHandlePOSLLH();
-      break;
-    case MT_NAV_STATUS:
-      UBXHandleSTATUS();
-      break;
-    case MT_NAV_TIME:
-      UBXHandleTIME();
-      break;
-#ifdef USE_GPS_VELOCITY
-    case MT_NAV_VEL:
-      UBXHandleVEL();
-      break;
-#endif  // USE_GPS_VELOCITY
-    default:
-      UBXHandleOther();
-      break;
-  }
 
 #ifdef USE_FLOG
   if (counter>UBX.state.log_interval) {
-    if (Flog->recording && new_position) {
+    if (Flog->recording && Gnss->st.position_valid) {
       UBX.rec_buffer.values.time = Rtc.local_time;
       Flog->addToBuffer(UBX.rec_buffer.bytes, sizeof(UBX.rec_buffer.bytes));
       counter = 0;
@@ -858,9 +1138,11 @@ const char HTTP_SNS_GPS[] PROGMEM = "{s}GPS " D_SAT_FIX "{m}%s{e}"
 #ifdef USE_GPS_VELOCITY
 const char HTTP_SNS_GPS2[] PROGMEM = "{s}GPS " D_SPEED "{m}%2_f " D_UNIT_KILOMETER_PER_HOUR "{e}"
                                      "{s}GPS " D_SPEED_ACCURACY "{m}%2_f " D_UNIT_KILOMETER_PER_HOUR "{e}"
-                                     "{s}GPS " D_HEADING "{m}%1_f{e}"
-                                     "{s}GPS " D_HEADING_ACCURACY "{m}%1_f{e}";
+                                     "{s}GPS " D_HEADING "{m}%1_f{e}";
 #endif  // USE_GPS_VELOCITY
+const char HTTP_SNS_GNSS[] PROGMEM = "{s}GPS receiver{m}%s{e}"
+                                     "{s}GPS satellites used / in view{m}%u / %u{e}"
+                                     "{s}GPS corrections{m}%s %s{e}";
 
 #ifdef USE_GPS_MAPS
 const char UBX_GOOGLE_MAPS[] ="<iframe width='100%%' src='https://maps.google.com/maps?width=&amp;height=&amp;hl=en&amp;q=%s %s+(Tasmota)&amp;ie=UTF8&amp;t=&amp;z=10&amp;iwloc=B&amp;output=embed' frameborder='0' scrolling='no' marginheight='0' marginwidth='0'></iframe>";
@@ -869,25 +1151,25 @@ const char UBX_GOOGLE_MAPS[] ="<iframe width='100%%' src='https://maps.google.co
 #endif  // USE_WEBSERVER
 
 const char kGPSFix[] PROGMEM = D_SAT_FIX_NO_FIX "|" D_SAT_FIX_DEAD_RECK "|" D_SAT_FIX_2D "|" D_SAT_FIX_3D "|" D_SAT_FIX_GPS_DEAD "|" D_SAT_FIX_TIME;
+const char kGnssCorr[] PROGMEM = "Off|Connecting|Connected|Retrying";
 
 /********************************************************************************************/
 
 void UBXShow(bool json) {
+  gnss_state_t *s = &Gnss->st;
   char fix[32];
-  GetTextIndexed(fix, sizeof(fix), UBX.state.gpsFix, kGPSFix);
+  GetTextIndexed(fix, sizeof(fix), s->fix_type <= 5 ? s->fix_type : 0, kGPSFix);
   char lat[FLOATSZ];
   dtostrfd((double)UBX.rec_buffer.values.lat / 10000000.0f, 7, lat);  // degrees
   char lon[FLOATSZ];
   dtostrfd((double)UBX.rec_buffer.values.lon / 10000000.0f, 7, lon);  // degrees
-  float hAcc = (float)UBX.state.last_vAcc / 1000.0f;                  // mm -> meters
-  float alt = (float)UBX.state.last_alt / 1000.0f;                    // mm -> meters
-  float vAcc = (float)UBX.state.last_hAcc / 1000.0f;                  // mm -> meters
+  float hAcc = (float)s->h_acc_mm / 1000.0f;                          // mm -> meters
+  float alt = (float)s->alt_msl_mm / 1000.0f;                         // mm -> meters
+  float vAcc = (float)s->v_acc_mm / 1000.0f;                          // mm -> meters
 #ifdef USE_GPS_VELOCITY
-  float spd = (float)UBX.Message.navVel.gSpeed / 27.778f;             // cm/s -> km/h
-  float sAcc = (float)UBX.Message.navVel.sAcc / 27.778f;              // cm/s -> km/h
-  float hdng = (float)UBX.Message.navVel.heading / 100000.0f;         // degrees
-  float cAcc = (float)UBX.Message.navVel.cAcc / 100000.0f;            // degrees
-  if (cAcc > 360) { cAcc = 0; }
+  float spd = (float)s->speed_mm_s / 277.778f;                        // mm/s -> km/h
+  float sAcc = (float)s->speed_acc_mm_s / 277.778f;                   // mm/s -> km/h
+  float hdng = (float)s->course_e5 / 100000.0f;                       // degrees
 #endif  // USE_GPS_VELOCITY
 
   if (json) {
@@ -896,11 +1178,10 @@ void UBXShow(bool json) {
       uint32_t i = UBX.state.log_interval / 10;
       ResponseAppend_P(PSTR("\"Fil\":%u,\"Int\":%u}"), UBX.mode.filter_noise, i);
     } else {
-      ResponseAppend_P(PSTR("\"Lat\":%s,\"Lon\":%s,\"Alt\":%3_f,\"hAcc\":%3_f,\"vAcc\":%3_f,\"Fix\":\"%s\""),
-        lat, lon, &alt, &hAcc, &vAcc, fix);
+      ResponseAppend_P(PSTR("\"Lat\":%s,\"Lon\":%s,\"Alt\":%3_f,\"hAcc\":%3_f,\"vAcc\":%3_f,\"Fix\":\"%s\",\"Sats\":%u"),
+        lat, lon, &alt, &hAcc, &vAcc, fix, gnss_count_sats(s, GNSS_UNKNOWN, true));
 #ifdef USE_GPS_VELOCITY
-      ResponseAppend_P(PSTR(",\"Spd\":%2_f,\"Hdng\":%1_f,\"sAcc\":%2_f,\"cAcc\":%1_f"), 
-        &spd, &hdng, &sAcc, &cAcc);
+      ResponseAppend_P(PSTR(",\"Spd\":%2_f,\"Hdng\":%1_f,\"sAcc\":%2_f"), &spd, &hdng, &sAcc);
 #endif  // USE_GPS_VELOCITY
       ResponseAppend_P(PSTR("}"));
     }
@@ -912,8 +1193,13 @@ void UBXShow(bool json) {
   } else {
     WSContentSend_PD(HTTP_SNS_GPS, fix, lat, lon, &hAcc, &alt, &vAcc);
 #ifdef USE_GPS_VELOCITY
-    WSContentSend_PD(HTTP_SNS_GPS2, &spd, &sAcc, &hdng, &cAcc);
+    WSContentSend_PD(HTTP_SNS_GPS2, &spd, &sAcc, &hdng);
 #endif  // USE_GPS_VELOCITY
+    char corr[16];
+    GetTextIndexed(corr, sizeof(corr), Gnss->corr_state, kGnssCorr);
+    WSContentSend_PD(HTTP_SNS_GNSS, s->model[0] ? s->model : "searching",
+                     gnss_count_sats(s, GNSS_UNKNOWN, true), gnss_count_sats(s, GNSS_UNKNOWN, false),
+                     corr, Gnss->corr_state == GNSS_CORR_DISABLED ? "" : Gnss->corr_mount);
 
 #ifdef USE_GPS_MAPS
     int32_t lat_diff = UBX.rec_buffer.values.lat - UBX.lat;
@@ -979,21 +1265,35 @@ bool Xsns60(uint32_t function)
 
   if (UBX.mode.init) {
     switch (function) {
+      case FUNC_LOOP:
+#ifdef USE_FLOG
+        if (!Flog->running_download)
+#endif  // USE_FLOG
+        {
+          GnssLoop();
+        }
+        break;
       case FUNC_COMMAND_SENSOR:
         if (XSNS_60 == XdrvMailbox.index) {
           result = UBXCmd();
         }
         break;
+      case FUNC_COMMAND:
+        result = DecodeCommand(kGnssCommands, GnssCommand);
+        break;
       case FUNC_EVERY_50_MSECOND:
         UBXLoop50msec(); // handles virtual serial port and NTP server
         break;
       case FUNC_EVERY_100_MSECOND:
-#ifdef USE_FLOG
-        if (!Flog->running_download)
-#endif  // USE_FLOG
-        {
-          UBXLoop();
-        }
+        UBXLoop();       // flash log
+        GnssHassStep();
+        break;
+      case FUNC_EVERY_SECOND:
+        GnssEverySecond();
+        break;
+      case FUNC_MQTT_INIT:
+        Gnss->hass_index = 0;      // the broker may have lost retained discovery
+        Gnss->n_announced = 0;
         break;
 #ifdef USE_FLOG
       case FUNC_WEB_ADD_HANDLER:
