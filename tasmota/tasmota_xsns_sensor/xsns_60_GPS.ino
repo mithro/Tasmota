@@ -60,18 +60,23 @@ Quectel LC29H. Any other receiver that speaks NMEA is read, but not configured.
 
 ## Usage:
 The serial pins are GPS_RX and GPS_TX, and optionally GPS PPS. The GPS_RX variant no longer sets the
-speed: the driver searches 9600, 38400 and 115200 baud unless GpsBaud fixes it.
+speed. The first time, the driver searches 9600, 38400 and 115200 baud, identifies the receiver and
+remembers it; after that it goes straight to that receiver's speed and configures it. GpsModule and
+GpsBaud fix either by hand.
 
 ## Commands:
 
-+ GpsBaud <speed>          fix the receiver's UART speed; 0 searches (default)
++ GpsModule auto|ublox7|m8|m10|lc29h   the receiver type; auto identifies it once and remembers it (default)
++ GpsBaud <speed>          fix the receiver's UART speed; 0 finds it (default)
++ GpsConfig                every setting, including the remembered receiver
 + GpsNtrip 0               corrections off
 + GpsNtrip 1               corrections from the ten64 proxy, mountpoint chosen by receiver (default)
 + GpsNtrip <host>:<port>/<mount>[ <user> <password>]   corrections from a caster of your choice
 + GpsPeriod <seconds>      how often tele/<topic>/GNSS is published (default 10)
 + GpsSatEntities 0|1       one Home Assistant entity per satellite (default 0)
 + GpsHass 0|1              Home Assistant discovery (default 1)
-+ GpsReinit                identify and configure the receiver again
++ GpsReinit                forget the remembered receiver and identify it again (with GpsModule set:
+                           configure it again)
 + GpsStatus                the full state, as published on tele/<topic>/GNSS
 
 + sensor60 0 .. 15, 1001 .. 1065   as before (flash log, noise filter, NTP server, virtual port, rate)
@@ -98,6 +103,7 @@ rule3 on tele-FLOG#sec do DisplayText  [f0c1l4]SAV:%value% endon on tele-FLOG#re
 #include "tasmota_xsns_sensor/gnss/gnss_ubx.h"
 #include "tasmota_xsns_sensor/gnss/gnss_rtcm.h"
 #include "tasmota_xsns_sensor/gnss/gnss_module.h"
+#include "tasmota_xsns_sensor/gnss/gnss_link.h"
 #include "tasmota_xsns_sensor/gnss/gnss_json.h"
 
 /*********************************************************************************************\
@@ -117,16 +123,10 @@ const char kUBXTypes[] PROGMEM = "UBX";
 #define NTP_MILLIS_OFFSET      50              // estimated latency in milliseconds
 
 #define GNSS_CFG_FILE          "/gnss.cfg"
-#define GNSS_CFG_MAGIC         0x47505331      // "GPS1"
+#define GNSS_CFG_MAGIC         0x47505332      // "GPS2": a different layout from "GPS1" is not read
 #define GNSS_NTRIP_HOST        "10.1.10.1"     // the ten64 proxy, as the IoT VLAN reaches it
 #define GNSS_NTRIP_PORT        2101
-#define GNSS_SEARCH_MS         2500            // time at each speed while searching
-#define GNSS_PROBE_MS          1500            // time to wait for an identification reply
-#define GNSS_CMD_GAP_MS        150             // between configuration commands
-#define GNSS_SILENT_MS         10000           // no valid frame this long: search again
 #define GNSS_MAX_ANNOUNCED     128             // per-satellite entities remembered
-
-static const uint32_t kGnssBauds[] = {9600, 38400, 115200};
 
 /********************************************************************************************\
 | *globals
@@ -177,11 +177,12 @@ struct UBX_t {
   size_t TCPbufSize;
 } UBX;
 
-enum GnssPhase { GNSS_SEARCH, GNSS_PROBE, GNSS_CONFIGURE, GNSS_RUNNING };
-
 struct GnssSettings {
   uint32_t magic;
-  uint32_t baud;               // 0 = search
+  uint32_t baud;               // GpsBaud: 0 = find it
+  uint8_t module;              // GpsModule: 0 = identify it
+  uint8_t known_module;        // the receiver last identified (remembered, so it is not searched for)
+  uint32_t known_baud;         // and the speed it was found at
   uint16_t period;             // seconds between tele/<topic>/GNSS
   uint8_t sat_entities;
   uint8_t hass;
@@ -199,14 +200,10 @@ struct GNSS_t {
   gnss_rtcm_t rtcm;
   gnss_dechunk_t dechunk;
   GnssSettings cfg;
+  gnss_link_t link;            // bringing the receiver up: see gnss_link.h
 
-  uint8_t phase;
-  uint8_t baud_index;
-  uint32_t baud;
-  uint32_t phase_ms;           // when the current phase / step started
-  uint8_t step;                // probe step or configuration index
+  uint32_t baud;               // the UART speed now
   uint32_t last_frame_ms;
-  bool got_frame;              // a valid frame since the phase started
   uint32_t last_epoch;
 
   // NTRIP
@@ -274,6 +271,8 @@ void GnssLoadSettings(void) {
     Gnss->cfg.user[sizeof(Gnss->cfg.user) - 1] = 0;
     Gnss->cfg.password[sizeof(Gnss->cfg.password) - 1] = 0;
     if (Gnss->cfg.period < 1) { Gnss->cfg.period = 10; }
+    if (Gnss->cfg.module > GNSS_MODULE_QUECTEL_LC29H) { Gnss->cfg.module = GNSS_MODULE_UNKNOWN; }
+    if (Gnss->cfg.known_module > GNSS_MODULE_UBLOX_OTHER) { Gnss->cfg.known_module = GNSS_MODULE_UNKNOWN; }
   }
 #endif  // USE_UFILESYS
 }
@@ -299,89 +298,51 @@ void GnssSetBaud(uint32_t baud) {
   AddLog(LOG_LEVEL_DEBUG, PSTR("GPS: UART at %u baud"), baud);
 }
 
-void GnssStartSearch(void) {
+/* The settings gnss_link needs, and back again. */
+void GnssLinkCfg(void *cp) {
+  gnss_link_cfg_t *c = (gnss_link_cfg_t*)cp;
+  c->fixed_module = Gnss->cfg.module;
+  c->fixed_baud = Gnss->cfg.baud;
+  c->known_module = Gnss->cfg.known_module;
+  c->known_baud = Gnss->cfg.known_baud;
+}
+
+/* (Re)start bringing the receiver up, from the saved settings. */
+void GnssLinkStart(void) {
+  gnss_link_cfg_t c;
+  GnssLinkCfg(&c);
   gnss_stream_init(&Gnss->stream);
-  Gnss->st.module = GNSS_MODULE_UNKNOWN;
   Gnss->st.model[0] = 0;
-  Gnss->phase = GNSS_SEARCH;
-  Gnss->phase_ms = millis();
-  Gnss->got_frame = false;
-  if (Gnss->cfg.baud) {
-    GnssSetBaud(Gnss->cfg.baud);
-  } else {
-    GnssSetBaud(kGnssBauds[Gnss->baud_index % (sizeof(kGnssBauds) / sizeof(kGnssBauds[0]))]);
+  gnss_link_start(&Gnss->link, &c, &Gnss->st, millis());
+}
+
+/* Carry out what gnss_link asks for. */
+void GnssLinkAction(void *ap) {
+  gnss_link_action_t *a = (gnss_link_action_t*)ap;
+  if (a->baud && a->baud != Gnss->baud) { GnssSetBaud(a->baud); }
+  if (a->send_len) { GnssWrite(a->send, a->send_len); }
+  if (a->baud_after && a->baud_after != Gnss->baud) {
+    UBXSerial->flush();
+    delay(20);                  // let the receiver act on the last byte
+    GnssSetBaud(a->baud_after);
   }
+  if (a->save) {
+    Gnss->cfg.known_module = Gnss->link.cfg.known_module;
+    Gnss->cfg.known_baud = Gnss->link.cfg.known_baud;
+    GnssSaveSettings();
+  }
+  if (a->log[0]) { AddLog(LOG_LEVEL_INFO, PSTR("%s"), a->log); }
 }
 
-void GnssSendProbe(void) {
-  uint8_t out[32];
-  size_t n = gnss_module_probe(Gnss->step, out, sizeof(out));
-  if (n) { GnssWrite(out, n); }
-  Gnss->phase_ms = millis();
-}
-
-void GnssIdentified(void) {
-  AddLog(LOG_LEVEL_INFO, PSTR("GPS: %s (%s, %s) at %u baud"), Gnss->st.model, Gnss->st.sw_version,
-         Gnss->st.hw_version, Gnss->baud);
-  Gnss->phase = GNSS_CONFIGURE;
-  Gnss->step = 0;
-  Gnss->phase_ms = millis() - GNSS_CMD_GAP_MS;
-  Gnss->hass_index = 0;         // republish discovery: the device model is now known
-}
-
-void GnssPhaseStep(void) {
-  uint32_t now = millis();
-  switch (Gnss->phase) {
-    case GNSS_SEARCH:
-      if (Gnss->got_frame) {
-        Gnss->phase = GNSS_PROBE;
-        Gnss->step = 0;
-        GnssSendProbe();
-      } else if (now - Gnss->phase_ms > GNSS_SEARCH_MS) {
-        Gnss->baud_index++;
-        GnssStartSearch();
-      }
-      break;
-    case GNSS_PROBE:
-      if (Gnss->st.module != GNSS_MODULE_UNKNOWN) {
-        GnssIdentified();
-      } else if (now - Gnss->phase_ms > GNSS_PROBE_MS) {
-        Gnss->step++;
-        uint8_t out[32];
-        if (gnss_module_probe(Gnss->step, out, sizeof(out))) {
-          GnssSendProbe();
-        } else {
-          AddLog(LOG_LEVEL_INFO, PSTR("GPS: receiver not identified; reading its NMEA as it is"));
-          Gnss->phase = GNSS_RUNNING;
-        }
-      }
-      break;
-    case GNSS_CONFIGURE:
-      if (now - Gnss->phase_ms >= GNSS_CMD_GAP_MS) {
-        uint8_t out[256];
-        uint32_t switch_baud = 0;
-        size_t n = gnss_module_config(Gnss->st.module, Gnss->step, out, sizeof(out), &switch_baud);
-        if (!n) {
-          Gnss->phase = GNSS_RUNNING;
-          AddLog(LOG_LEVEL_INFO, PSTR("GPS: configured"));
-          break;
-        }
-        GnssWrite(out, n);
-        if (switch_baud && switch_baud != Gnss->baud && !Gnss->cfg.baud) {
-          UBXSerial->flush();
-          delay(20);              // let the receiver act on the last byte
-          GnssSetBaud(switch_baud);
-        }
-        Gnss->step++;
-        Gnss->phase_ms = now;
-      }
-      break;
-    case GNSS_RUNNING:
-      if (now - Gnss->last_frame_ms > GNSS_SILENT_MS) {
-        AddLog(LOG_LEVEL_INFO, PSTR("GPS: receiver silent, searching again"));
-        GnssStartSearch();
-      }
-      break;
+void GnssLinkStep(void) {
+  uint8_t phase = Gnss->link.phase;
+  uint8_t module = Gnss->link.module;
+  gnss_link_action_t a;
+  for (uint32_t i = 0; i < 4 && gnss_link_step(&Gnss->link, &Gnss->st, millis(), &a); i++) {
+    GnssLinkAction(&a);
+  }
+  if (Gnss->link.phase == GNSS_LINK_RUNNING && (phase != GNSS_LINK_RUNNING || module != Gnss->link.module)) {
+    Gnss->hass_index = 0;       // republish discovery: the device model is now known
   }
 }
 
@@ -420,7 +381,7 @@ void GnssNtripStop(uint8_t state, const char *error) {
 
 const char *GnssNtripMount(void) {
   if (Gnss->cfg.ntrip == 2) { return Gnss->cfg.mount; }
-  return gnss_module_mount(Gnss->st.module);
+  return gnss_module_mount(Gnss->link.module);
 }
 
 void GnssNtripConnect(void) {
@@ -455,7 +416,7 @@ void GnssCorrections(uint8_t *data, size_t len) {
   uint32_t frames = gnss_rtcm_feed(&Gnss->rtcm, data, len);
   // RTCM 3 is alive when frames check out; a stream that has never framed (RTCM 2.3) on any data.
   if (frames || Gnss->rtcm.frames == 0) { Gnss->last_rtcm_ms = millis(); }
-  if (Gnss->phase == GNSS_RUNNING) { GnssWrite(data, len); }
+  if (Gnss->link.phase == GNSS_LINK_RUNNING) { GnssWrite(data, len); }
 }
 
 /* Stream bytes after the header: hold the first few until the de-chunker can decide. */
@@ -535,7 +496,7 @@ void GnssNtripLoop(void) {
 }
 
 void GnssNtripEverySecond(void) {
-  bool wanted = Gnss->cfg.ntrip != 0 && Gnss->phase == GNSS_RUNNING && *GnssNtripMount() &&
+  bool wanted = Gnss->cfg.ntrip != 0 && Gnss->link.phase == GNSS_LINK_RUNNING && *GnssNtripMount() &&
                 !TasmotaGlobal.global_state.network_down;
   if (!wanted) {
     if (Gnss->ntrip || Gnss->corr_state != GNSS_CORR_DISABLED) {
@@ -577,7 +538,7 @@ void GnssFrame(uint32_t t) {
       return;
   }
   Gnss->last_frame_ms = millis();
-  Gnss->got_frame = true;
+  gnss_link_frame(&Gnss->link, Gnss->last_frame_ms);
 }
 
 void UBXSelectMode(uint16_t mode);
@@ -635,7 +596,7 @@ void GnssLoop(void) {
     Gnss->last_epoch = Gnss->st.epoch;
     GnssNewEpoch();
   }
-  GnssPhaseStep();
+  GnssLinkStep();
   GnssNtripLoop();
 }
 
@@ -782,10 +743,11 @@ void GnssEverySecond(void) {
 \*********************************************************************************************/
 
 const char kGnssCommands[] PROGMEM = "Gps|"
-  "Baud|Ntrip|Period|SatEntities|Hass|Reinit|Status";
+  "Baud|Module|Ntrip|Period|SatEntities|Hass|Reinit|Config|Status";
 
 void (* const GnssCommand[])(void) PROGMEM = {
-  &CmndGpsBaud, &CmndGpsNtrip, &CmndGpsPeriod, &CmndGpsSatEntities, &CmndGpsHass, &CmndGpsReinit, &CmndGpsStatus };
+  &CmndGpsBaud, &CmndGpsModule, &CmndGpsNtrip, &CmndGpsPeriod, &CmndGpsSatEntities, &CmndGpsHass,
+  &CmndGpsReinit, &CmndGpsConfig, &CmndGpsStatus };
 
 void CmndGpsBaud(void) {
   if (XdrvMailbox.data_len > 0) {
@@ -793,10 +755,28 @@ void CmndGpsBaud(void) {
     if (baud == 0 || baud == 9600 || baud == 19200 || baud == 38400 || baud == 57600 || baud == 115200 || baud == 230400) {
       Gnss->cfg.baud = baud;
       GnssSaveSettings();
-      GnssStartSearch();
+      GnssLinkStart();
     }
   }
   ResponseCmndNumber(Gnss->cfg.baud);
+}
+
+/* GpsModule auto | ublox7 | m8 | m10 | lc29h */
+void CmndGpsModule(void) {
+  if (XdrvMailbox.data_len > 0) {
+    uint8_t module;
+    if (!gnss_module_from_key(XdrvMailbox.data, &module)) {
+      ResponseCmndChar_P(PSTR("Use auto, ublox7, m8, m10 or lc29h"));
+      return;
+    }
+    Gnss->cfg.module = module;
+    GnssSaveSettings();
+    GnssLinkStart();
+  }
+  Response_P(PSTR("{\"%s\":{\"Set\":\"%s\",\"Remembered\":\"%s\",\"Active\":\"%s\"}}"), XdrvMailbox.command,
+             gnss_module_key(Gnss->cfg.module),
+             Gnss->cfg.known_module ? gnss_module_key(Gnss->cfg.known_module) : "none",
+             Gnss->link.module ? gnss_module_key(Gnss->link.module) : "none");
 }
 
 void CmndGpsNtrip(void) {
@@ -865,9 +845,29 @@ void CmndGpsHass(void) {
   ResponseCmndStateText(Gnss->cfg.hass);
 }
 
+/* Forget the remembered receiver and identify it again (GpsModule auto), or
+ * just reconfigure the one set with GpsModule. */
 void CmndGpsReinit(void) {
-  GnssStartSearch();
+  if (Gnss->cfg.module) {
+    GnssLinkStart();
+  } else {
+    gnss_link_action_t a;
+    gnss_link_forget(&Gnss->link, &Gnss->st, millis(), &a);
+    GnssLinkAction(&a);
+  }
   ResponseCmndDone();
+}
+
+/* Every setting, as one JSON object. The NTRIP password is not shown. */
+void CmndGpsConfig(void) {
+  Response_P(PSTR("{\"%s\":{\"Module\":\"%s\",\"Baud\":%u,\"Remembered\":{\"Module\":\"%s\",\"Baud\":%u},"
+                  "\"Ntrip\":%u,\"Caster\":\"%s:%u\",\"Mount\":\"%s\",\"User\":\"%s\",\"Password\":\"%s\","
+                  "\"Period\":%u,\"SatEntities\":%u,\"Hass\":%u}}"),
+             XdrvMailbox.command, gnss_module_key(Gnss->cfg.module), Gnss->cfg.baud,
+             Gnss->cfg.known_module ? gnss_module_key(Gnss->cfg.known_module) : "none", Gnss->cfg.known_baud,
+             Gnss->cfg.ntrip, Gnss->cfg.host, Gnss->cfg.port, GnssNtripMount(), Gnss->cfg.user,
+             Gnss->cfg.password[0] ? "****" : "",
+             Gnss->cfg.period, Gnss->cfg.sat_entities, Gnss->cfg.hass);
 }
 
 void CmndGpsStatus(void) {
@@ -899,7 +899,7 @@ void UBXDetect(void) {
   GnssLoadSettings();
 
   UBXSerial = new TasmotaSerial(Pin(GPIO_GPS_RX, GPIO_ANY), Pin(GPIO_GPS_TX), 1, 0, UBX_SERIAL_BUFFER_SIZE);
-  if (!UBXSerial->begin(Gnss->cfg.baud ? Gnss->cfg.baud : kGnssBauds[0])) { return; }
+  if (!UBXSerial->begin(Gnss->cfg.baud ? Gnss->cfg.baud : 9600)) { return; }
 
   if (UBXSerial->hardwareSerial()) {
     ClaimSerial();
@@ -914,7 +914,7 @@ void UBXDetect(void) {
     attachInterrupt(Gnss->pps_pin, GnssPpsIsr, RISING);
   }
 
-  GnssStartSearch();
+  GnssLinkStart();
   UBX.mode.init = 1;
 
 #ifdef USE_FLOG
