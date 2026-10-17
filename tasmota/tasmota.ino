@@ -523,6 +523,15 @@ void setup(void) {
 
   if (is_connected_to_USB) {
     // TasConsole is already running
+#if ARDUINO_USB_MODE && SOC_USB_SERIAL_JTAG_SUPPORTED
+    // Never block on the console. Plugged in but with no host reading the
+    // port (the cable powers the node, nothing has the tty open), the core's
+    // HWCDC::write() retries a full ring 20 times at the TX timeout, 100 ms:
+    // 2 s per log line, which stalled every web command by 2 s and the main
+    // loop for a minute at a time (esp32-to-gps, arduino-esp32 3.3.12).
+    // With no timeout a write that finds the ring full drops what does not fit.
+    HWCDCSerial.setTxTimeoutMs(0);
+#endif  // ARDUINO_USB_MODE && SOC_USB_SERIAL_JTAG_SUPPORTED
 #if !ARDUINO_USB_MODE
     USB.begin();                 // This needs a serial console with DTR/DSR support
 #endif  // No ARDUINO_USB_MODE

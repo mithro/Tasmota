@@ -189,9 +189,11 @@ static void rmc(gnss_state_t *s, const fields_t *fs) {
     s->motion_valid = true;
   }
   if (active && fixed(field(fs, 8), 5, &v)) { s->course_e5 = (int32_t)v; }
+  /* The date only of a valid fix: before one the LC29H(AA) sends its
+   * placeholder 060180 (2080-01-06), which must never reach the clock. */
   const char *d = field(fs, 9);
   int date;
-  if (strlen(d) == 6 && integer(d, &date)) {
+  if (active && strlen(d) == 6 && integer(d, &date)) {
     s->day = (uint8_t)(date / 10000);
     s->month = (uint8_t)(date / 100 % 100);
     s->year = (uint16_t)(2000 + date % 100);
