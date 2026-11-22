@@ -521,6 +521,22 @@ void setup(void) {
   is_connected_to_USB = true;      // S2
 #endif  // SOC_USB_SERIAL_JTAG_SUPPORTED
 
+#if ARDUINO_USB_MODE && SOC_USB_SERIAL_JTAG_SUPPORTED
+  // Keep the USB-Serial-JTAG console whether or not a host was seen above.
+  // Upstream falls back to UART0 when no SOF arrives within 250 ms, and the
+  // ~HWCDC() that does it leaves D+/D- driven low, so the node is invisible on
+  // USB until its next reset. A host is rarely that quick: a Pi Zero's USB
+  // comes up ~6 s after a shared power-up, and a hot plug takes longer than
+  // 250 ms to its first SOF (hub status poll + 100 ms debounce + port reset).
+  // The USB-Serial-JTAG enumerates in hardware, so left running it appears
+  // whenever a host turns up, even hours later (esp32-to-gps issue #10).
+  // Writes cannot stall with no host reading: see setTxTimeoutMs(0) below.
+  if (!is_connected_to_USB) {
+    is_connected_to_USB = true;
+    AddLog(LOG_LEVEL_INFO, PSTR("CMD: No USB host yet, keeping USB CDC for when one appears"));
+  }
+#endif  // ARDUINO_USB_MODE && SOC_USB_SERIAL_JTAG_SUPPORTED
+
   if (is_connected_to_USB) {
     // TasConsole is already running
 #if ARDUINO_USB_MODE && SOC_USB_SERIAL_JTAG_SUPPORTED
